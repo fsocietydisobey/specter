@@ -1,0 +1,31 @@
+[project]
+name = "specter"
+version = "0.1.0"
+description = "Browser debugging MCP server. Connects to Firefox via CDP, captures console logs, errors, network activity, and screenshots for AI-assisted debugging."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]",
+    "websockets",
+    "httpx",
+    "click",
+]
+
+[project.scripts]
+specter = "specter.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/specter"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
