@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from specter.browser.connection import CDPConnection
 from specter.browser.console import ConsoleCapture
+from specter.browser.interact import Interactor
 from specter.browser.network import NetworkCapture
 from specter.browser.react import ReactInspector
 from specter.browser.runtime import Runtime
@@ -49,22 +50,24 @@ _console: ConsoleCapture | None = None
 _network: NetworkCapture | None = None
 _runtime: Runtime | None = None
 _react: ReactInspector | None = None
+_interact: Interactor | None = None
 
 
-async def _ensure_connected() -> tuple[CDPConnection, ConsoleCapture, NetworkCapture, Runtime, ReactInspector]:
+async def _ensure_connected():
     """Ensure we have a live CDP connection, reconnecting if needed."""
-    global _connection, _console, _network, _runtime, _react
+    global _connection, _console, _network, _runtime, _react, _interact
 
     config = load_config()
 
     if _connection is not None and _connection.is_connected:
-        return _connection, _console, _network, _runtime, _react
+        return _connection, _console, _network, _runtime, _react, _interact
 
     _connection = CDPConnection(config)
     _console = ConsoleCapture(config)
     _network = NetworkCapture(config)
     _runtime = Runtime(config)
     _react = ReactInspector()
+    _interact = Interactor()
 
     _console.register(_connection)
     _network.register(_connection)
@@ -75,7 +78,7 @@ async def _ensure_connected() -> tuple[CDPConnection, ConsoleCapture, NetworkCap
 
     logger.info("Connected to: %s (%s)", target.title, target.url)
 
-    return _connection, _console, _network, _runtime, _react
+    return _connection, _console, _network, _runtime, _react, _interact
 
 
 @mcp.tool()
@@ -96,7 +99,7 @@ async def take_screenshot(
     Returns:
         Dict with file_path to the saved PNG, timestamp, and dimensions.
     """
-    conn, _, _, runtime, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _ = await _ensure_connected()
     return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
 
 
@@ -120,7 +123,7 @@ async def get_console_logs(
     Returns:
         List of console entries with timestamp, level, text, source location.
     """
-    _, console, _, _, _ = await _ensure_connected()
+    _, console, _, _, _, _ = await _ensure_connected()
     return console.get_logs(level=level, since=since, limit=limit)
 
 
@@ -139,7 +142,7 @@ async def get_errors(since: float | None = None, limit: int = 50) -> list[dict]:
     Returns:
         List of exception entries with message, source, line, column, stack_trace.
     """
-    _, console, _, _, _ = await _ensure_connected()
+    _, console, _, _, _, _ = await _ensure_connected()
     return console.get_errors(since=since, limit=limit)
 
 
@@ -162,7 +165,7 @@ async def get_network_errors(
     Returns:
         List of failed network entries with method, URL, status, error text, duration.
     """
-    _, _, network, _, _ = await _ensure_connected()
+    _, _, network, _, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=True, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -185,7 +188,7 @@ async def get_network_log(
     Returns:
         List of all network entries with method, URL, status, duration.
     """
-    _, _, network, _, _ = await _ensure_connected()
+    _, _, network, _, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=False, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -209,7 +212,7 @@ async def evaluate_js(expression: str) -> dict:
     Returns:
         Dict with type, value, and description of the result.
     """
-    conn, _, _, runtime, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _ = await _ensure_connected()
     return await runtime.evaluate_js(conn, expression)
 
 
@@ -223,7 +226,7 @@ async def get_page_info() -> dict:
     Returns:
         Dict with url, title, readyState.
     """
-    conn, _, _, runtime, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _ = await _ensure_connected()
     return await runtime.get_page_info(conn)
 
 
@@ -241,7 +244,7 @@ async def get_dom_html(selector: str = "body", outer: bool = False) -> dict:
     Returns:
         Dict with the HTML content (truncated at 50KB if very large).
     """
-    conn, _, _, runtime, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _ = await _ensure_connected()
     return await runtime.get_dom_html(conn, selector=selector, outer=outer)
 
 
@@ -256,7 +259,7 @@ async def list_tabs() -> list[dict]:
     Returns:
         List of tab dicts with id, title, url.
     """
-    conn, _, _, _, _ = await _ensure_connected()
+    conn, _, _, _, _, _ = await _ensure_connected()
     targets = await conn.list_targets()
     return [t.to_dict() for t in targets]
 
@@ -270,7 +273,7 @@ async def clear_logs() -> dict:
     Returns:
         Dict with count of entries cleared.
     """
-    _, console, network, _, _ = await _ensure_connected()
+    _, console, network, _, _, _ = await _ensure_connected()
     console_count = console.clear()
     network_count = network.clear()
     return {"console_cleared": console_count, "network_cleared": network_count}
@@ -290,7 +293,7 @@ async def check_react() -> dict:
     Returns:
         Dict with availability info for React, Redux, and Next.js.
     """
-    conn, _, _, _, react = await _ensure_connected()
+    conn, _, _, _, react, _ = await _ensure_connected()
     return await react.check_react_available(conn)
 
 
@@ -312,7 +315,7 @@ async def get_component_tree(max_depth: int = 15, max_children: int = 50) -> dic
     Returns:
         Nested component tree with names, source, props, hooks, children.
     """
-    conn, _, _, _, react = await _ensure_connected()
+    conn, _, _, _, react, _ = await _ensure_connected()
     return await react.get_component_tree(conn, max_depth=max_depth, max_children=max_children)
 
 
@@ -335,7 +338,7 @@ async def get_component_at(selector: str) -> dict:
     Returns:
         Dict with component name, source location, props, and parent chain.
     """
-    conn, _, _, _, react = await _ensure_connected()
+    conn, _, _, _, react, _ = await _ensure_connected()
     return await react.get_component_at(conn, selector)
 
 
@@ -359,7 +362,7 @@ async def get_redux_state(path: str = "") -> dict:
     Returns:
         Dict with the state value or a summary of top-level keys.
     """
-    conn, _, _, _, react = await _ensure_connected()
+    conn, _, _, _, react, _ = await _ensure_connected()
     return await react.get_redux_state(conn, path=path)
 
 
@@ -374,5 +377,104 @@ async def get_redux_actions() -> dict:
     Returns:
         Dict with Redux DevTools status and current state shape.
     """
-    conn, _, _, _, react = await _ensure_connected()
+    conn, _, _, _, react, _ = await _ensure_connected()
     return await react.get_redux_actions(conn)
+
+
+# ─── Browser interaction tools ─────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_interactive_elements(role: str | None = None) -> list[dict]:
+    """Get all interactive elements on the page (buttons, links, inputs, etc.).
+
+    Returns every clickable, typeable, and selectable element with:
+      - A stable CSS selector (prefers data-testid, then id, then aria-label)
+      - The visible label/text
+      - The element's role (button, link, textbox, checkbox, etc.)
+      - Current state (value, checked, disabled)
+      - Bounding box (x, y, width, height)
+
+    Use this to understand the page's interactive surface, then use
+    click_element, fill_input, or select_option to interact.
+
+    Args:
+        role: Optional filter by role ("button", "link", "textbox", etc.).
+
+    Returns:
+        List of interactive element descriptors.
+    """
+    conn, _, _, _, _, interact = await _ensure_connected()
+    return await interact.get_interactive_elements(conn, role_filter=role)
+
+
+@mcp.tool()
+async def click_element(selector: str) -> dict:
+    """Click an element by CSS selector.
+
+    Scrolls the element into view, then dispatches the full mouse event
+    sequence (mousedown → mouseup → click) that React expects.
+
+    Use get_interactive_elements first to find the right selector.
+
+    Args:
+        selector: CSS selector for the element to click.
+
+    Returns:
+        Confirmation of the click or error if element not found.
+    """
+    conn, _, _, _, _, interact = await _ensure_connected()
+    return await interact.click_element(conn, selector)
+
+
+@mcp.tool()
+async def fill_input(selector: str, value: str) -> dict:
+    """Type a value into an input field or textarea.
+
+    Handles React controlled inputs by using the native value setter
+    and dispatching both input and change events. Clears existing
+    content before typing.
+
+    Args:
+        selector: CSS selector for the input element.
+        value: Text to type into the field.
+
+    Returns:
+        Confirmation with the resulting value.
+    """
+    conn, _, _, _, _, interact = await _ensure_connected()
+    return await interact.fill_input(conn, selector, value)
+
+
+@mcp.tool()
+async def select_option(selector: str, option_value: str) -> dict:
+    """Select an option from a dropdown by value or visible text.
+
+    Args:
+        selector: CSS selector for the select element.
+        option_value: The option's value attribute or visible text.
+
+    Returns:
+        Confirmation or list of available options if not found.
+    """
+    conn, _, _, _, _, interact = await _ensure_connected()
+    return await interact.select_option(conn, selector, option_value)
+
+
+@mcp.tool()
+async def wait_for_element(selector: str, timeout_ms: int = 10000) -> dict:
+    """Wait for an element to appear and become visible.
+
+    Polls every 200ms until the element exists and has layout. Useful
+    after clicking something that triggers navigation, a modal, or
+    lazy-loaded content.
+
+    Args:
+        selector: CSS selector to wait for.
+        timeout_ms: Maximum wait time in milliseconds (default 10000).
+
+    Returns:
+        Dict with found status and elapsed time.
+    """
+    conn, _, _, _, _, interact = await _ensure_connected()
+    return await interact.wait_for_element(conn, selector, timeout_ms=timeout_ms)
