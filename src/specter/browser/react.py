@@ -1,0 +1,497 @@
+"""React component tree inspection via fiber internals.
+
+Injects helper scripts into the page that walk React's internal fiber
+tree (available in dev mode via __REACT_DEVTOOLS_GLOBAL_HOOK__) to
+extract component names, props, state, hooks, source locations, and
+parent/child hierarchy.
+
+This gives Claude the same information the React DevTools extension
+shows — without requiring the extension to be installed.
+
+IMPORTANT: Only works when React is running in development mode.
+Production builds strip the debug hooks.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from specter.browser.connection import CDPConnection
+
+logger = logging.getLogger(__name__)
+
+# JavaScript helper that walks the React fiber tree.
+# Injected into the page via Runtime.evaluate.
+# Returns a JSON-serializable tree of component info.
+FIBER_WALK_SCRIPT = """
+(() => {
+  const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  if (!hook) return JSON.stringify({ error: "React DevTools hook not found. Is React running in development mode?" });
+
+  const renderers = hook.renderers;
+  if (!renderers || renderers.size === 0) return JSON.stringify({ error: "No React renderers found." });
+
+  // Get the first renderer's fiber roots
+  const rendererId = renderers.keys().next().value;
+  const fiberRoots = hook.getFiberRoots(rendererId);
+  if (!fiberRoots || fiberRoots.size === 0) return JSON.stringify({ error: "No fiber roots found." });
+
+  const root = fiberRoots.values().next().value;
+  const rootFiber = root.current;
+  if (!rootFiber) return JSON.stringify({ error: "No current fiber on root." });
+
+  const MAX_DEPTH = %MAX_DEPTH%;
+  const MAX_CHILDREN = %MAX_CHILDREN%;
+
+  function getComponentName(fiber) {
+    if (!fiber.type) return null;
+    if (typeof fiber.type === 'string') return null; // DOM elements like 'div'
+    return fiber.type.displayName || fiber.type.name || null;
+  }
+
+  function getSource(fiber) {
+    const src = fiber._debugSource;
+    if (!src) return null;
+    return {
+      fileName: src.fileName || null,
+      lineNumber: src.lineNumber || null,
+      columnNumber: src.columnNumber || null,
+    };
+  }
+
+  function serializeValue(val, depth) {
+    if (depth > 3) return '[nested]';
+    if (val === null || val === undefined) return val;
+    if (typeof val === 'function') return '[function]';
+    if (typeof val === 'symbol') return val.toString();
+    if (val instanceof Element) return '[DOMElement]';
+    if (Array.isArray(val)) {
+      if (val.length > 10) return '[Array(' + val.length + ')]';
+      return val.map(v => serializeValue(v, depth + 1));
+    }
+    if (typeof val === 'object') {
+      // React elements
+      if (val.$$typeof) return '[ReactElement: ' + (val.type?.displayName || val.type?.name || val.type || 'unknown') + ']';
+      const keys = Object.keys(val);
+      if (keys.length > 20) return '[Object(' + keys.length + ' keys)]';
+      const out = {};
+      for (const k of keys) {
+        out[k] = serializeValue(val[k], depth + 1);
+      }
+      return out;
+    }
+    return val;
+  }
+
+  function getProps(fiber) {
+    if (!fiber.memoizedProps) return null;
+    return serializeValue(fiber.memoizedProps, 0);
+  }
+
+  function getHooks(fiber) {
+    const hooks = [];
+    let hookNode = fiber.memoizedState;
+    let index = 0;
+    while (hookNode && index < 20) {
+      const hook = { index };
+
+      // Try to identify hook type from the queue
+      const queue = hookNode.queue;
+      if (queue) {
+        if (queue.lastRenderedReducer) {
+          const reducerName = queue.lastRenderedReducer.name;
+          if (reducerName === 'basicStateReducer') {
+            hook.type = 'useState';
+            hook.value = serializeValue(hookNode.memoizedState, 0);
+          } else {
+            hook.type = 'useReducer';
+            hook.value = serializeValue(hookNode.memoizedState, 0);
+          }
+        }
+      } else if (hookNode.memoizedState && hookNode.memoizedState.destroy !== undefined) {
+        hook.type = 'useEffect';
+        const deps = hookNode.memoizedState.deps;
+        hook.deps = deps ? serializeValue(deps, 0) : null;
+      } else if (hookNode.memoizedState && typeof hookNode.memoizedState === 'object' && 'current' in hookNode.memoizedState) {
+        hook.type = 'useRef';
+        hook.value = serializeValue(hookNode.memoizedState.current, 0);
+      } else {
+        hook.type = 'unknown';
+        hook.value = serializeValue(hookNode.memoizedState, 0);
+      }
+
+      hooks.push(hook);
+      hookNode = hookNode.next;
+      index++;
+    }
+    return hooks.length > 0 ? hooks : null;
+  }
+
+  function walkFiber(fiber, depth) {
+    if (!fiber || depth > MAX_DEPTH) return null;
+
+    const name = getComponentName(fiber);
+
+    // Skip non-component fibers (DOM elements, fragments, providers, etc.)
+    // but still walk their children
+    if (!name) {
+      const children = [];
+      let child = fiber.child;
+      while (child && children.length < MAX_CHILDREN) {
+        const result = walkFiber(child, depth);
+        if (result) {
+          if (Array.isArray(result)) children.push(...result);
+          else children.push(result);
+        }
+        child = child.sibling;
+      }
+      return children.length > 0 ? children : null;
+    }
+
+    const node = {
+      name,
+      source: getSource(fiber),
+      props: getProps(fiber),
+      hooks: getHooks(fiber),
+      children: [],
+    };
+
+    let child = fiber.child;
+    while (child && node.children.length < MAX_CHILDREN) {
+      const result = walkFiber(child, depth + 1);
+      if (result) {
+        if (Array.isArray(result)) node.children.push(...result);
+        else node.children.push(result);
+      }
+      child = child.sibling;
+    }
+
+    return node;
+  }
+
+  const tree = walkFiber(rootFiber, 0);
+  return JSON.stringify(tree || { error: "Empty component tree" });
+})()
+"""
+
+# Script to find the fiber for a specific DOM element
+FIBER_FROM_ELEMENT_SCRIPT = """
+((selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return JSON.stringify({ error: "Element not found: " + selector });
+
+  // React attaches fiber references to DOM nodes via keys starting with __reactFiber$
+  const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+  if (!fiberKey) return JSON.stringify({ error: "No React fiber found on element. Is this a React-rendered element?" });
+
+  const fiber = el[fiberKey];
+
+  // Walk up to find the nearest component fiber (not a DOM fiber)
+  let current = fiber;
+  while (current) {
+    if (typeof current.type === 'function' || (typeof current.type === 'object' && current.type !== null)) {
+      const name = current.type.displayName || current.type.name;
+      if (name) {
+        const src = current._debugSource;
+        const props = current.memoizedProps;
+
+        // Serialize props safely
+        function serializeValue(val, depth) {
+          if (depth > 2) return '[nested]';
+          if (val === null || val === undefined) return val;
+          if (typeof val === 'function') return '[function]';
+          if (typeof val === 'symbol') return val.toString();
+          if (val instanceof Element) return '[DOMElement]';
+          if (Array.isArray(val)) {
+            if (val.length > 10) return '[Array(' + val.length + ')]';
+            return val.map(v => serializeValue(v, depth + 1));
+          }
+          if (typeof val === 'object') {
+            if (val.$$typeof) return '[ReactElement]';
+            const keys = Object.keys(val);
+            if (keys.length > 20) return '[Object(' + keys.length + ' keys)]';
+            const out = {};
+            for (const k of keys) out[k] = serializeValue(val[k], depth + 1);
+            return out;
+          }
+          return val;
+        }
+
+        // Get parent component chain
+        const parents = [];
+        let parent = current.return;
+        while (parent && parents.length < 10) {
+          if (typeof parent.type === 'function' || (typeof parent.type === 'object' && parent.type !== null)) {
+            const pName = parent.type?.displayName || parent.type?.name;
+            if (pName) {
+              parents.push({
+                name: pName,
+                source: parent._debugSource ? {
+                  fileName: parent._debugSource.fileName,
+                  lineNumber: parent._debugSource.lineNumber,
+                } : null,
+              });
+            }
+          }
+          parent = parent.return;
+        }
+
+        return JSON.stringify({
+          name,
+          source: src ? { fileName: src.fileName, lineNumber: src.lineNumber, columnNumber: src.columnNumber } : null,
+          props: serializeValue(props, 0),
+          parents,
+        });
+      }
+    }
+    current = current.return;
+  }
+
+  return JSON.stringify({ error: "No React component found in fiber tree above this element" });
+})('%SELECTOR%')
+"""
+
+# Script to read Redux store state
+REDUX_STATE_SCRIPT = """
+(() => {
+  // Try common Redux store access patterns
+  const store =
+    window.__REDUX_STORE__ ||
+    window.__NEXT_REDUX_WRAPPER_STORE__ ||
+    window.store ||
+    (window.__NEXT_DATA__ && window.__NEXT_DATA__.props?.pageProps?.store);
+
+  // Try Redux DevTools extension
+  if (!store) {
+    const devtools = window.__REDUX_DEVTOOLS_EXTENSION__;
+    if (devtools) {
+      return JSON.stringify({ source: 'devtools_extension', note: 'Store not directly accessible. Use evaluate_js with your app-specific store path.' });
+    }
+    return JSON.stringify({ error: 'Redux store not found. Try evaluate_js with your app-specific store access pattern.' });
+  }
+
+  const state = store.getState();
+  const path = '%PATH%';
+
+  if (path && path !== '') {
+    const parts = path.split('.');
+    let current = state;
+    for (const part of parts) {
+      if (current === null || current === undefined) break;
+      current = current[part];
+    }
+    return JSON.stringify({ path, value: current });
+  }
+
+  // For the full state, return just the top-level keys and their types
+  const summary = {};
+  for (const [key, value] of Object.entries(state)) {
+    if (Array.isArray(value)) summary[key] = `[Array(${value.length})]`;
+    else if (typeof value === 'object' && value !== null) summary[key] = `{${Object.keys(value).length} keys}`;
+    else summary[key] = value;
+  }
+  return JSON.stringify({ source: 'store.getState()', keys: Object.keys(state), summary });
+})()
+"""
+
+# Script to get Redux action history (if devtools middleware is active)
+REDUX_ACTIONS_SCRIPT = """
+(() => {
+  // Redux DevTools stores action history internally
+  // We can access it through the devtools instance
+  const devtools = window.__REDUX_DEVTOOLS_EXTENSION_COMPOSE__
+    ? 'compose_available'
+    : window.__REDUX_DEVTOOLS_EXTENSION__
+    ? 'extension_available'
+    : null;
+
+  if (!devtools) {
+    return JSON.stringify({ error: 'Redux DevTools not found. Actions history requires the devtools middleware.' });
+  }
+
+  // The most reliable way: look for the devtools connector instance
+  // This is internal but commonly accessible
+  const store = window.__REDUX_STORE__ || window.__NEXT_REDUX_WRAPPER_STORE__ || window.store;
+  if (!store || !store.dispatch) {
+    return JSON.stringify({ error: 'Store not directly accessible for action interception.' });
+  }
+
+  return JSON.stringify({
+    note: 'Action history requires the Redux DevTools browser extension to be active. Use evaluate_js to manually check specific state paths.',
+    current_state_keys: Object.keys(store.getState()),
+  });
+})()
+"""
+
+
+class ReactInspector:
+    """React component tree and Redux state inspector."""
+
+    async def get_component_tree(
+        self,
+        connection: CDPConnection,
+        max_depth: int = 15,
+        max_children: int = 50,
+    ) -> dict:
+        """Walk the React fiber tree and return the component hierarchy.
+
+        Args:
+            connection: Active CDP connection.
+            max_depth: Maximum tree depth to walk (default 15).
+            max_children: Maximum children per component (default 50).
+
+        Returns:
+            Nested dict representing the component tree with names, props,
+            hooks, source locations, and children.
+        """
+        script = FIBER_WALK_SCRIPT.replace("%MAX_DEPTH%", str(max_depth)).replace(
+            "%MAX_CHILDREN%", str(max_children)
+        )
+
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": False},
+        )
+
+        return _parse_js_result(result)
+
+    async def get_component_at(
+        self,
+        connection: CDPConnection,
+        selector: str,
+    ) -> dict:
+        """Get the React component that owns a specific DOM element.
+
+        Walks up the fiber tree from the DOM element to find the nearest
+        component, returning its name, props, source location, and parent
+        component chain.
+
+        Args:
+            connection: Active CDP connection.
+            selector: CSS selector for the DOM element.
+
+        Returns:
+            Dict with component name, source, props, and parent chain.
+        """
+        script = FIBER_FROM_ELEMENT_SCRIPT.replace("%SELECTOR%", selector.replace("'", "\\'"))
+
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": False},
+        )
+
+        return _parse_js_result(result)
+
+    async def get_redux_state(
+        self,
+        connection: CDPConnection,
+        path: str = "",
+    ) -> dict:
+        """Read the Redux store state.
+
+        Args:
+            connection: Active CDP connection.
+            path: Dot-separated path into the state tree (e.g., "auth.session").
+                  Empty string returns a summary of top-level keys.
+
+        Returns:
+            Dict with the state value at the given path, or a summary.
+        """
+        script = REDUX_STATE_SCRIPT.replace("%PATH%", path)
+
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": False},
+        )
+
+        return _parse_js_result(result)
+
+    async def get_redux_actions(self, connection: CDPConnection) -> dict:
+        """Get Redux action history (requires DevTools middleware).
+
+        Args:
+            connection: Active CDP connection.
+
+        Returns:
+            Dict with recent actions or a note about required setup.
+        """
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": REDUX_ACTIONS_SCRIPT, "returnByValue": True, "awaitPromise": False},
+        )
+
+        return _parse_js_result(result)
+
+    async def check_react_available(self, connection: CDPConnection) -> dict:
+        """Check if React DevTools hook is available and what version is running.
+
+        Args:
+            connection: Active CDP connection.
+
+        Returns:
+            Dict with React availability, version, and renderer info.
+        """
+        script = """
+        (() => {
+            const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            if (!hook) return JSON.stringify({ available: false, reason: "No __REACT_DEVTOOLS_GLOBAL_HOOK__. React may not be loaded or is in production mode." });
+
+            const renderers = hook.renderers;
+            const rendererInfo = [];
+            if (renderers) {
+                for (const [id, renderer] of renderers) {
+                    rendererInfo.push({
+                        id,
+                        version: renderer.version || 'unknown',
+                        bundleType: renderer.bundleType || 'unknown',
+                    });
+                }
+            }
+
+            const fiberRoots = renderers && renderers.size > 0
+                ? hook.getFiberRoots(renderers.keys().next().value)
+                : null;
+
+            return JSON.stringify({
+                available: true,
+                renderers: rendererInfo,
+                fiberRootCount: fiberRoots ? fiberRoots.size : 0,
+                hasReduxDevtools: !!window.__REDUX_DEVTOOLS_EXTENSION__,
+                hasNextData: !!window.__NEXT_DATA__,
+            });
+        })()
+        """
+
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": False},
+        )
+
+        return _parse_js_result(result)
+
+
+def _parse_js_result(result: dict) -> dict:
+    """Parse a CDP Runtime.evaluate result that returns a JSON string."""
+    remote_object = result.get("result", {})
+
+    if result.get("exceptionDetails"):
+        return {
+            "error": result["exceptionDetails"].get("text", "JS evaluation error"),
+        }
+
+    value = remote_object.get("value")
+    if value is None:
+        return {"error": "No value returned"}
+
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw": value}
+
+    if isinstance(value, dict):
+        return value
+
+    return {"value": value}

@@ -605,6 +605,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
     { name = "websockets" },
 ]
@@ -612,6 +613,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "click" },
+    { name = "httpx" },
     { name = "mcp", extras = ["cli"] },
     { name = "websockets" },
 ]

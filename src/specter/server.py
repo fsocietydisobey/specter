@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from specter.browser.connection import CDPConnection
 from specter.browser.console import ConsoleCapture
 from specter.browser.network import NetworkCapture
+from specter.browser.react import ReactInspector
 from specter.browser.runtime import Runtime
 from specter.config import load_config
 
@@ -29,14 +30,16 @@ mcp = FastMCP(
     instructions=(
         "Specter gives you eyes into the browser. It connects to a running "
         "Firefox instance and captures console logs, errors, network activity, "
-        "and screenshots in real time.\n\n"
+        "screenshots, and React component internals in real time.\n\n"
         "Firefox must be running with: firefox --remote-debugging-port 9222\n\n"
         "Debugging workflow:\n"
         "1. take_screenshot — see what the user sees\n"
         "2. get_console_logs — check for errors and warnings\n"
         "3. get_network_errors — check for failed API calls\n"
-        "4. evaluate_js — inspect runtime state (variables, DOM, localStorage)\n"
-        "5. Fix the code, then take_screenshot again to verify"
+        "4. get_component_tree or get_component_at — inspect React components, props, hooks\n"
+        "5. get_redux_state — check Redux store state\n"
+        "6. evaluate_js — inspect any runtime state\n"
+        "7. Fix the code, then take_screenshot again to verify"
     ),
 )
 
@@ -45,21 +48,23 @@ _connection: CDPConnection | None = None
 _console: ConsoleCapture | None = None
 _network: NetworkCapture | None = None
 _runtime: Runtime | None = None
+_react: ReactInspector | None = None
 
 
-async def _ensure_connected() -> tuple[CDPConnection, ConsoleCapture, NetworkCapture, Runtime]:
+async def _ensure_connected() -> tuple[CDPConnection, ConsoleCapture, NetworkCapture, Runtime, ReactInspector]:
     """Ensure we have a live CDP connection, reconnecting if needed."""
-    global _connection, _console, _network, _runtime
+    global _connection, _console, _network, _runtime, _react
 
     config = load_config()
 
     if _connection is not None and _connection.is_connected:
-        return _connection, _console, _network, _runtime
+        return _connection, _console, _network, _runtime, _react
 
     _connection = CDPConnection(config)
     _console = ConsoleCapture(config)
     _network = NetworkCapture(config)
     _runtime = Runtime(config)
+    _react = ReactInspector()
 
     _console.register(_connection)
     _network.register(_connection)
@@ -70,7 +75,7 @@ async def _ensure_connected() -> tuple[CDPConnection, ConsoleCapture, NetworkCap
 
     logger.info("Connected to: %s (%s)", target.title, target.url)
 
-    return _connection, _console, _network, _runtime
+    return _connection, _console, _network, _runtime, _react
 
 
 @mcp.tool()
@@ -91,7 +96,7 @@ async def take_screenshot(
     Returns:
         Dict with file_path to the saved PNG, timestamp, and dimensions.
     """
-    conn, _, _, runtime = await _ensure_connected()
+    conn, _, _, runtime, _ = await _ensure_connected()
     return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
 
 
@@ -115,7 +120,7 @@ async def get_console_logs(
     Returns:
         List of console entries with timestamp, level, text, source location.
     """
-    _, console, _, _ = await _ensure_connected()
+    _, console, _, _, _ = await _ensure_connected()
     return console.get_logs(level=level, since=since, limit=limit)
 
 
@@ -134,7 +139,7 @@ async def get_errors(since: float | None = None, limit: int = 50) -> list[dict]:
     Returns:
         List of exception entries with message, source, line, column, stack_trace.
     """
-    _, console, _, _ = await _ensure_connected()
+    _, console, _, _, _ = await _ensure_connected()
     return console.get_errors(since=since, limit=limit)
 
 
@@ -157,7 +162,7 @@ async def get_network_errors(
     Returns:
         List of failed network entries with method, URL, status, error text, duration.
     """
-    _, _, network, _ = await _ensure_connected()
+    _, _, network, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=True, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -180,7 +185,7 @@ async def get_network_log(
     Returns:
         List of all network entries with method, URL, status, duration.
     """
-    _, _, network, _ = await _ensure_connected()
+    _, _, network, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=False, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -204,7 +209,7 @@ async def evaluate_js(expression: str) -> dict:
     Returns:
         Dict with type, value, and description of the result.
     """
-    conn, _, _, runtime = await _ensure_connected()
+    conn, _, _, runtime, _ = await _ensure_connected()
     return await runtime.evaluate_js(conn, expression)
 
 
@@ -218,7 +223,7 @@ async def get_page_info() -> dict:
     Returns:
         Dict with url, title, readyState.
     """
-    conn, _, _, runtime = await _ensure_connected()
+    conn, _, _, runtime, _ = await _ensure_connected()
     return await runtime.get_page_info(conn)
 
 
@@ -236,7 +241,7 @@ async def get_dom_html(selector: str = "body", outer: bool = False) -> dict:
     Returns:
         Dict with the HTML content (truncated at 50KB if very large).
     """
-    conn, _, _, runtime = await _ensure_connected()
+    conn, _, _, runtime, _ = await _ensure_connected()
     return await runtime.get_dom_html(conn, selector=selector, outer=outer)
 
 
@@ -251,7 +256,7 @@ async def list_tabs() -> list[dict]:
     Returns:
         List of tab dicts with id, title, url.
     """
-    conn, _, _, _ = await _ensure_connected()
+    conn, _, _, _, _ = await _ensure_connected()
     targets = await conn.list_targets()
     return [t.to_dict() for t in targets]
 
@@ -265,7 +270,109 @@ async def clear_logs() -> dict:
     Returns:
         Dict with count of entries cleared.
     """
-    _, console, network, _ = await _ensure_connected()
+    _, console, network, _, _ = await _ensure_connected()
     console_count = console.clear()
     network_count = network.clear()
     return {"console_cleared": console_count, "network_cleared": network_count}
+
+
+# ─── React component inspection tools ─────────────────────────────────
+
+
+@mcp.tool()
+async def check_react() -> dict:
+    """Check if React is running in development mode and what's available.
+
+    Run this first before using React inspection tools. Reports:
+    React version, renderer info, whether fiber roots exist, whether
+    Redux DevTools and Next.js data are present.
+
+    Returns:
+        Dict with availability info for React, Redux, and Next.js.
+    """
+    conn, _, _, _, react = await _ensure_connected()
+    return await react.check_react_available(conn)
+
+
+@mcp.tool()
+async def get_component_tree(max_depth: int = 15, max_children: int = 50) -> dict:
+    """Walk the React component tree and return the full hierarchy.
+
+    Returns every React component with its name, source file + line,
+    current props, hooks (useState values, useEffect deps, useRef values),
+    and children. This is the same information the React DevTools
+    "Components" panel shows.
+
+    Only works in React development mode.
+
+    Args:
+        max_depth: Maximum tree depth to walk (default 15).
+        max_children: Maximum children per component (default 50).
+
+    Returns:
+        Nested component tree with names, source, props, hooks, children.
+    """
+    conn, _, _, _, react = await _ensure_connected()
+    return await react.get_component_tree(conn, max_depth=max_depth, max_children=max_children)
+
+
+@mcp.tool()
+async def get_component_at(selector: str) -> dict:
+    """Get the React component that owns a specific DOM element.
+
+    Finds the DOM element by CSS selector, then walks up the React fiber
+    tree to find the nearest component. Returns the component's name,
+    source file, current props, and the chain of parent components above
+    it in the tree.
+
+    Useful for answering: "what component renders this element, and what
+    props is it receiving?"
+
+    Args:
+        selector: CSS selector for the DOM element (e.g., ".quote-details",
+                  "#main-content", "[data-testid='login-form']").
+
+    Returns:
+        Dict with component name, source location, props, and parent chain.
+    """
+    conn, _, _, _, react = await _ensure_connected()
+    return await react.get_component_at(conn, selector)
+
+
+@mcp.tool()
+async def get_redux_state(path: str = "") -> dict:
+    """Read the Redux store state.
+
+    With no path: returns a summary of top-level state keys and their
+    shapes (useful for orientation).
+    With a path: returns the value at that path (e.g., "auth.session"
+    returns the session object).
+
+    The store is located via common globals: window.__REDUX_STORE__,
+    window.__NEXT_REDUX_WRAPPER_STORE__, or window.store. If your app
+    uses a different pattern, use evaluate_js to access it directly.
+
+    Args:
+        path: Dot-separated path into the state tree (e.g., "auth.session",
+              "quotes.selectedBidId"). Empty string = summary view.
+
+    Returns:
+        Dict with the state value or a summary of top-level keys.
+    """
+    conn, _, _, _, react = await _ensure_connected()
+    return await react.get_redux_state(conn, path=path)
+
+
+@mcp.tool()
+async def get_redux_actions() -> dict:
+    """Get info about Redux action dispatch capabilities.
+
+    Reports whether Redux DevTools is available and lists current
+    state keys. Full action history replay requires the Redux DevTools
+    browser extension.
+
+    Returns:
+        Dict with Redux DevTools status and current state shape.
+    """
+    conn, _, _, _, react = await _ensure_connected()
+    return await react.get_redux_actions(conn)
