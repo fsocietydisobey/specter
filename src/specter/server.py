@@ -46,8 +46,10 @@ mcp = FastMCP(
         "4. Use debug_snapshot() as the starting point — it returns screenshot "
         "+ page info + console errors + network errors + page structure in "
         "one call.\n\n"
-        "5. For in-app navigation use router_navigate(path), NOT navigate_to. "
-        "navigate_to does a hard reload that resets app state.\n\n"
+        "5. To navigate, use click_element on links/buttons — the same way a "
+        "user would. Use get_interactive_elements to find clickable links. "
+        "Do NOT try to manipulate URLs or use history API — the app's router "
+        "controls navigation.\n\n"
         "6. Don't fight with navigation to debug. If you need to see data, "
         "use evaluate_js to inspect it directly — don't navigate to a "
         "different page hoping to see it visually.\n\n"
@@ -643,53 +645,11 @@ async def press_key(
     return await interact.press_key(conn, key, modifiers=modifiers, selector=selector)
 
 
-@mcp.tool()
-async def navigate_to(url: str) -> dict:
-    """Hard navigate the browser to a URL (full page reload).
-
-    Uses CDP Page.navigate — equivalent to typing a URL in the address bar.
-    Triggers a full page load. The app will re-initialize from scratch.
-
-    For in-app navigation that preserves state, use router_navigate instead.
-
-    Args:
-        url: Full URL to navigate to.
-
-    Returns:
-        Dict confirming the navigation.
-    """
-    conn, _, _, runtime, _, _, _ = await _ensure_connected()
-    return await runtime.navigate_to(conn, url)
-
-
-@mcp.tool()
-async def router_navigate(path: str) -> dict:
-    """Client-side navigate using the app's own router (preserves state).
-
-    This is the same navigation that happens when a user clicks an internal
-    link — no full reload, app state is preserved, the router handles the
-    transition. Use this instead of navigate_to for in-app routing.
-
-    Detects and uses: Next.js App Router, Next.js Pages Router, or
-    History API as fallback.
-
-    Examples:
-      - router_navigate("/shop/dashboard/quotes")
-      - router_navigate("/shop/quote/6/description?source=9")
-
-    After navigation, call wait_for_network_idle() before taking a
-    screenshot to ensure data has loaded.
-
-    Args:
-        path: The path to navigate to (e.g., "/shop/quote/6/description").
-              Can include query params. Do NOT include the origin
-              (http://localhost:3000) — just the path.
-
-    Returns:
-        Dict with navigation result and which router was used.
-    """
-    conn, _, _, runtime, _, _, _ = await _ensure_connected()
-    return await runtime.router_navigate(conn, path)
+# NOTE: navigate_to and router_navigate are DISABLED.
+# Next.js App Router strips query params and resets state on programmatic
+# navigation. Use click_element + get_interactive_elements to navigate
+# the app the same way a user would — by clicking links and buttons.
+# The code is in runtime.py if these are ever re-enabled.
 
 
 @mcp.tool()
