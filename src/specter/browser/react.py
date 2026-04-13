@@ -253,46 +253,120 @@ FIBER_FROM_ELEMENT_SCRIPT = """
 })('%SELECTOR%')
 """
 
-# Script to read Redux store state
+# Script to read Redux store state.
+# Strategy: try globals first (fast), then walk ALL fiber roots across ALL
+# renderers (handles Next.js App Router where the Provider lives in a
+# client-component fiber root separate from the server shell root).
 REDUX_STATE_SCRIPT = """
 (() => {
-  // Try common Redux store access patterns
-  const store =
+  // 1. Check common globals (fastest path — works if app exposes the store)
+  const globalStore =
     window.__REDUX_STORE__ ||
+    window.__SPECTER_STORE__ ||
     window.__NEXT_REDUX_WRAPPER_STORE__ ||
-    window.store ||
-    (window.__NEXT_DATA__ && window.__NEXT_DATA__.props?.pageProps?.store);
+    window.store;
 
-  // Try Redux DevTools extension
-  if (!store) {
-    const devtools = window.__REDUX_DEVTOOLS_EXTENSION__;
-    if (devtools) {
-      return JSON.stringify({ source: 'devtools_extension', note: 'Store not directly accessible. Use evaluate_js with your app-specific store path.' });
+  if (globalStore && typeof globalStore.getState === 'function') {
+    return readStore(globalStore, 'global', '%PATH%');
+  }
+
+  // 2. Walk ALL React fiber roots across ALL renderers.
+  //    Next.js 14+ App Router creates multiple roots (server shell + client app).
+  //    The Redux Provider is in the client root, which may not be the first one.
+  const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  if (hook && hook.renderers) {
+    for (const [rendererId, renderer] of hook.renderers) {
+      const roots = hook.getFiberRoots(rendererId);
+      if (!roots) continue;
+      for (const root of roots) {
+        const store = findStoreInFiber(root.current, 0);
+        if (store) {
+          // Cache it globally so future calls are instant
+          window.__SPECTER_STORE__ = store;
+          return readStore(store, 'fiber:renderer_' + rendererId, '%PATH%');
+        }
+      }
     }
-    return JSON.stringify({ error: 'Redux store not found. Try evaluate_js with your app-specific store access pattern.' });
   }
 
-  const state = store.getState();
-  const path = '%PATH%';
+  // 3. Last resort: check if Redux DevTools extension is available
+  if (window.__REDUX_DEVTOOLS_EXTENSION__) {
+    return JSON.stringify({
+      error: 'Store found in DevTools but not directly accessible.',
+      hint: 'Add this to your store file: if (typeof window !== "undefined") window.__REDUX_STORE__ = store;',
+    });
+  }
 
-  if (path && path !== '') {
-    const parts = path.split('.');
-    let current = state;
-    for (const part of parts) {
-      if (current === null || current === undefined) break;
-      current = current[part];
+  return JSON.stringify({ error: 'Redux store not found.' });
+
+  // --- helpers ---
+
+  function findStoreInFiber(fiber, depth) {
+    if (!fiber || depth > 80) return null;
+
+    // Check props.store (react-redux Provider)
+    const props = fiber.memoizedProps;
+    if (props) {
+      if (props.store && typeof props.store.getState === 'function') return props.store;
+      // Some wrappers nest it: props.value.store
+      if (props.value && props.value.store && typeof props.value.store.getState === 'function') return props.value.store;
     }
-    return JSON.stringify({ path, value: current });
+
+    // Check stateNode (class components)
+    if (fiber.stateNode && fiber.stateNode.store && typeof fiber.stateNode.store.getState === 'function') {
+      return fiber.stateNode.store;
+    }
+
+    // Walk children + siblings
+    let child = fiber.child;
+    while (child) {
+      const found = findStoreInFiber(child, depth + 1);
+      if (found) return found;
+      child = child.sibling;
+    }
+    return null;
   }
 
-  // For the full state, return just the top-level keys and their types
-  const summary = {};
-  for (const [key, value] of Object.entries(state)) {
-    if (Array.isArray(value)) summary[key] = `[Array(${value.length})]`;
-    else if (typeof value === 'object' && value !== null) summary[key] = `{${Object.keys(value).length} keys}`;
-    else summary[key] = value;
+  function readStore(store, source, path) {
+    const state = store.getState();
+
+    if (path && path !== '') {
+      const parts = path.split('.');
+      let current = state;
+      for (const part of parts) {
+        if (current === null || current === undefined) break;
+        current = current[part];
+      }
+      // Serialize safely
+      function safe(val, depth) {
+        if (depth > 3) return '[nested]';
+        if (val === null || val === undefined) return val;
+        if (typeof val === 'function') return '[function]';
+        if (Array.isArray(val)) {
+          if (val.length > 20) return '[Array(' + val.length + ')]';
+          return val.map(v => safe(v, depth + 1));
+        }
+        if (typeof val === 'object') {
+          const keys = Object.keys(val);
+          if (keys.length > 30) return '[Object(' + keys.length + ' keys)]';
+          const out = {};
+          for (const k of keys) out[k] = safe(val[k], depth + 1);
+          return out;
+        }
+        return val;
+      }
+      return JSON.stringify({ source, path, value: safe(current, 0) });
+    }
+
+    // Summary view: top-level keys + shapes
+    const summary = {};
+    for (const [key, value] of Object.entries(state)) {
+      if (Array.isArray(value)) summary[key] = '[Array(' + value.length + ')]';
+      else if (typeof value === 'object' && value !== null) summary[key] = '{' + Object.keys(value).length + ' keys}';
+      else summary[key] = value;
+    }
+    return JSON.stringify({ source, keys: Object.keys(state), summary });
   }
-  return JSON.stringify({ source: 'store.getState()', keys: Object.keys(state), summary });
 })()
 """
 
