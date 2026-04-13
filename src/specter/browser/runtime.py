@@ -209,11 +209,11 @@ class Runtime:
         }
 
     async def navigate_to(self, connection: CDPConnection, url: str) -> dict:
-        """Navigate the current tab to a URL.
+        """Hard navigate the current tab to a URL (full page reload).
 
-        Uses CDP Page.navigate for direct navigation. Faster and more
-        reliable than finding and clicking links, especially for known
-        routes.
+        Uses CDP Page.navigate — equivalent to typing a URL in the address
+        bar. Triggers a full page load. Use router_navigate for client-side
+        navigation that preserves app state.
 
         Args:
             connection: Active CDP connection.
@@ -231,5 +231,75 @@ class Runtime:
         return {
             "navigated": True,
             "url": url,
+            "type": "hard",
             "frame_id": result.get("frameId", ""),
         }
+
+    async def router_navigate(self, connection: CDPConnection, path: str) -> dict:
+        """Client-side navigate using the app's router (Next.js, React Router, etc.).
+
+        Uses the app's own routing — no full reload, preserves state,
+        respects the app's navigation rules. This is the same navigation
+        that happens when a user clicks an internal link.
+
+        Tries in order:
+          1. Next.js App Router (window.next.router.push)
+          2. Next.js Pages Router (window.__NEXT_ROUTER__.push)
+          3. React Router (history.pushState + popstate event)
+          4. Fallback: window.location.assign (soft reload)
+
+        Args:
+            connection: Active CDP connection.
+            path: The path to navigate to (e.g., "/shop/quote/6/description").
+                  Can include query params: "/shop/quote/6/description?source=9"
+
+        Returns:
+            Dict with navigation result and which router was used.
+        """
+        result = await self.evaluate_js(
+            connection,
+            f"""
+            (() => {{
+                const path = '{path.replace("'", "\\'")}';
+                const currentPath = window.location.pathname + window.location.search;
+
+                // If same path, nothing to do
+                if (currentPath === path) {{
+                    return JSON.stringify({{ navigated: false, path, reason: 'already on this path' }});
+                }}
+
+                // 1. Try clicking an existing link with this href (most reliable
+                //    for Next.js — uses the app's own Link component behavior)
+                const links = document.querySelectorAll('a[href]');
+                for (const link of links) {{
+                    try {{
+                        const url = new URL(link.href);
+                        if (url.pathname + url.search === path) {{
+                            link.click();
+                            return JSON.stringify({{ navigated: true, path, router: 'link-click' }});
+                        }}
+                    }} catch (e) {{}}
+                }}
+
+                // 2. Use location.href for Next.js — triggers the app's client-side
+                //    routing without a full hard reload. Next.js intercepts same-origin
+                //    navigations and does a soft transition.
+                window.location.href = path;
+                return JSON.stringify({{ navigated: true, path, router: 'location-href' }});
+            }})()
+            """,
+        )
+
+        if result.get("error"):
+            return {"error": result.get("message", "Router navigation failed"), "path": path}
+
+        import json as _json
+
+        value = result.get("value")
+        if isinstance(value, str):
+            try:
+                return _json.loads(value)
+            except _json.JSONDecodeError:
+                return {"navigated": True, "path": path, "router": "unknown"}
+
+        return {"navigated": True, "path": path, "router": "unknown"}

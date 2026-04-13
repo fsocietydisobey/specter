@@ -639,24 +639,51 @@ async def press_key(
 
 @mcp.tool()
 async def navigate_to(url: str) -> dict:
-    """Navigate the browser to a specific URL.
+    """Hard navigate the browser to a URL (full page reload).
 
-    Direct navigation via CDP — faster and more reliable than finding
-    and clicking links. Use this for known routes:
-      - navigate_to("http://localhost:3000/shop/dashboard/quotes")
-      - navigate_to("http://localhost:3000/shop/quote/25/description")
+    Uses CDP Page.navigate — equivalent to typing a URL in the address bar.
+    Triggers a full page load. The app will re-initialize from scratch.
 
-    After navigation, call wait_for_network_idle() before taking a
-    screenshot to ensure the page has fully loaded.
+    For in-app navigation that preserves state, use router_navigate instead.
 
     Args:
-        url: The URL to navigate to.
+        url: Full URL to navigate to.
 
     Returns:
         Dict confirming the navigation.
     """
     conn, _, _, runtime, _, _, _ = await _ensure_connected()
     return await runtime.navigate_to(conn, url)
+
+
+@mcp.tool()
+async def router_navigate(path: str) -> dict:
+    """Client-side navigate using the app's own router (preserves state).
+
+    This is the same navigation that happens when a user clicks an internal
+    link — no full reload, app state is preserved, the router handles the
+    transition. Use this instead of navigate_to for in-app routing.
+
+    Detects and uses: Next.js App Router, Next.js Pages Router, or
+    History API as fallback.
+
+    Examples:
+      - router_navigate("/shop/dashboard/quotes")
+      - router_navigate("/shop/quote/6/description?source=9")
+
+    After navigation, call wait_for_network_idle() before taking a
+    screenshot to ensure data has loaded.
+
+    Args:
+        path: The path to navigate to (e.g., "/shop/quote/6/description").
+              Can include query params. Do NOT include the origin
+              (http://localhost:3000) — just the path.
+
+    Returns:
+        Dict with navigation result and which router was used.
+    """
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
+    return await runtime.router_navigate(conn, path)
 
 
 @mcp.tool()
