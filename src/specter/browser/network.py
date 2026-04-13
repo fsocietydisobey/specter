@@ -7,6 +7,7 @@ and surfaces failed requests (4xx/5xx) for debugging.
 from __future__ import annotations
 
 import time
+import asyncio
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -100,6 +101,46 @@ class NetworkCapture:
         self._buffer.clear()
         self._inflight.clear()
         return count
+
+    async def wait_for_idle(self, idle_ms: int = 500, timeout_ms: int = 10000) -> dict:
+        """Wait until no network requests are in-flight.
+
+        Polls every 100ms. Considers the network "idle" when no requests
+        have been pending for idle_ms milliseconds. Times out after
+        timeout_ms.
+
+        Args:
+            idle_ms: How long the network must be quiet to be considered idle.
+            timeout_ms: Maximum total wait time.
+
+        Returns:
+            Dict with idle status, inflight count, and elapsed time.
+        """
+        start = time.time()
+        last_activity = time.time()
+
+        while True:
+            elapsed = (time.time() - start) * 1000
+            if elapsed > timeout_ms:
+                return {
+                    "idle": False,
+                    "timeout": True,
+                    "inflight": len(self._inflight),
+                    "elapsed_ms": round(elapsed),
+                }
+
+            if len(self._inflight) == 0:
+                quiet_time = (time.time() - last_activity) * 1000
+                if quiet_time >= idle_ms:
+                    return {
+                        "idle": True,
+                        "elapsed_ms": round(elapsed),
+                        "inflight": 0,
+                    }
+            else:
+                last_activity = time.time()
+
+            await asyncio.sleep(0.1)
 
     def _on_request(self, params: dict) -> None:
         """Handle Network.requestWillBeSent."""

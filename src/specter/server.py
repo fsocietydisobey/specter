@@ -22,6 +22,7 @@ from specter.browser.interact import Interactor
 from specter.browser.network import NetworkCapture
 from specter.browser.react import ReactInspector
 from specter.browser.runtime import Runtime
+from specter.browser.structure import StructureAnalyzer
 from specter.config import load_config
 
 logger = logging.getLogger(__name__)
@@ -56,16 +57,17 @@ _network: NetworkCapture | None = None
 _runtime: Runtime | None = None
 _react: ReactInspector | None = None
 _interact: Interactor | None = None
+_structure: StructureAnalyzer | None = None
 
 
 async def _ensure_connected():
     """Ensure we have a live CDP connection, reconnecting if needed."""
-    global _connection, _console, _network, _runtime, _react, _interact
+    global _connection, _console, _network, _runtime, _react, _interact, _structure
 
     config = load_config()
 
     if _connection is not None and _connection.is_connected:
-        return _connection, _console, _network, _runtime, _react, _interact
+        return _connection, _console, _network, _runtime, _react, _interact, _structure
 
     _connection = CDPConnection(config)
     _console = ConsoleCapture(config)
@@ -73,6 +75,7 @@ async def _ensure_connected():
     _runtime = Runtime(config)
     _react = ReactInspector()
     _interact = Interactor()
+    _structure = StructureAnalyzer()
 
     _console.register(_connection)
     _network.register(_connection)
@@ -86,7 +89,7 @@ async def _ensure_connected():
 
     logger.info("Connected to: %s (%s)", target.title, target.url)
 
-    return _connection, _console, _network, _runtime, _react, _interact
+    return _connection, _console, _network, _runtime, _react, _interact, _structure
 
 
 @mcp.tool()
@@ -107,14 +110,14 @@ async def take_screenshot(
     Returns:
         Dict with file_path to the saved PNG, timestamp, and dimensions.
     """
-    conn, _, _, runtime, _, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
     try:
         return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
     except (RuntimeError, TimeoutError, OSError) as e:
         # Connection may have gone stale — force reconnect and retry once
         logger.warning("Screenshot failed (%s), reconnecting...", e)
         await _force_reconnect()
-        conn, _, _, runtime, _, _ = await _ensure_connected()
+        conn, _, _, runtime, _, _, _ = await _ensure_connected()
         return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
 
 
@@ -149,7 +152,7 @@ async def get_console_logs(
     Returns:
         List of console entries with timestamp, level, text, source location.
     """
-    _, console, _, _, _, _ = await _ensure_connected()
+    _, console, _, _, _, _, _ = await _ensure_connected()
     return console.get_logs(level=level, since=since, limit=limit)
 
 
@@ -168,7 +171,7 @@ async def get_errors(since: float | None = None, limit: int = 50) -> list[dict]:
     Returns:
         List of exception entries with message, source, line, column, stack_trace.
     """
-    _, console, _, _, _, _ = await _ensure_connected()
+    _, console, _, _, _, _, _ = await _ensure_connected()
     return console.get_errors(since=since, limit=limit)
 
 
@@ -191,7 +194,7 @@ async def get_network_errors(
     Returns:
         List of failed network entries with method, URL, status, error text, duration.
     """
-    _, _, network, _, _, _ = await _ensure_connected()
+    _, _, network, _, _, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=True, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -214,7 +217,7 @@ async def get_network_log(
     Returns:
         List of all network entries with method, URL, status, duration.
     """
-    _, _, network, _, _, _ = await _ensure_connected()
+    _, _, network, _, _, _, _ = await _ensure_connected()
     return network.get_requests(errors_only=False, since=since, limit=limit, url_filter=url_filter)
 
 
@@ -238,7 +241,7 @@ async def evaluate_js(expression: str) -> dict:
     Returns:
         Dict with type, value, and description of the result.
     """
-    conn, _, _, runtime, _, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
     return await runtime.evaluate_js(conn, expression)
 
 
@@ -252,7 +255,7 @@ async def get_page_info() -> dict:
     Returns:
         Dict with url, title, readyState.
     """
-    conn, _, _, runtime, _, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
     return await runtime.get_page_info(conn)
 
 
@@ -270,7 +273,7 @@ async def get_dom_html(selector: str = "body", outer: bool = False) -> dict:
     Returns:
         Dict with the HTML content (truncated at 50KB if very large).
     """
-    conn, _, _, runtime, _, _ = await _ensure_connected()
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
     return await runtime.get_dom_html(conn, selector=selector, outer=outer)
 
 
@@ -285,7 +288,7 @@ async def list_tabs() -> list[dict]:
         List of tab dicts with id, title, url, and which one is
         currently connected (if any).
     """
-    conn, _, _, _, _, _ = await _ensure_connected()
+    conn, _, _, _, _, _, _ = await _ensure_connected()
     targets = await conn.list_targets()
     current = conn.current_target
     result = []
@@ -311,7 +314,7 @@ async def connect_to_tab(tab_id: str) -> dict:
     Returns:
         Dict with the connected tab's title and URL.
     """
-    global _connection, _console, _network, _runtime, _react, _interact
+    global _connection, _console, _network, _runtime, _react, _interact, _structure
 
     config = load_config()
 
@@ -326,6 +329,7 @@ async def connect_to_tab(tab_id: str) -> dict:
     _runtime = Runtime(config)
     _react = ReactInspector()
     _interact = Interactor()
+    _structure = StructureAnalyzer()
 
     _console.register(_connection)
     _network.register(_connection)
@@ -357,7 +361,7 @@ async def reload_page(ignore_cache: bool = False) -> dict:
     Returns:
         Dict confirming the reload.
     """
-    conn, _, _, _, _, _ = await _ensure_connected()
+    conn, _, _, _, _, _, _ = await _ensure_connected()
     await conn.send("Page.reload", {"ignoreCache": ignore_cache})
     return {"reloaded": True, "ignore_cache": ignore_cache}
 
@@ -371,7 +375,7 @@ async def clear_logs() -> dict:
     Returns:
         Dict with count of entries cleared.
     """
-    _, console, network, _, _, _ = await _ensure_connected()
+    _, console, network, _, _, _, _ = await _ensure_connected()
     console_count = console.clear()
     network_count = network.clear()
     return {"console_cleared": console_count, "network_cleared": network_count}
@@ -391,7 +395,7 @@ async def check_react() -> dict:
     Returns:
         Dict with availability info for React, Redux, and Next.js.
     """
-    conn, _, _, _, react, _ = await _ensure_connected()
+    conn, _, _, _, react, _, _ = await _ensure_connected()
     return await react.check_react_available(conn)
 
 
@@ -413,7 +417,7 @@ async def get_component_tree(max_depth: int = 15, max_children: int = 50) -> dic
     Returns:
         Nested component tree with names, source, props, hooks, children.
     """
-    conn, _, _, _, react, _ = await _ensure_connected()
+    conn, _, _, _, react, _, _ = await _ensure_connected()
     return await react.get_component_tree(conn, max_depth=max_depth, max_children=max_children)
 
 
@@ -436,7 +440,7 @@ async def get_component_at(selector: str) -> dict:
     Returns:
         Dict with component name, source location, props, and parent chain.
     """
-    conn, _, _, _, react, _ = await _ensure_connected()
+    conn, _, _, _, react, _, _ = await _ensure_connected()
     return await react.get_component_at(conn, selector)
 
 
@@ -460,7 +464,7 @@ async def get_redux_state(path: str = "") -> dict:
     Returns:
         Dict with the state value or a summary of top-level keys.
     """
-    conn, _, _, _, react, _ = await _ensure_connected()
+    conn, _, _, _, react, _, _ = await _ensure_connected()
     return await react.get_redux_state(conn, path=path)
 
 
@@ -475,7 +479,7 @@ async def get_redux_actions() -> dict:
     Returns:
         Dict with Redux DevTools status and current state shape.
     """
-    conn, _, _, _, react, _ = await _ensure_connected()
+    conn, _, _, _, react, _, _ = await _ensure_connected()
     return await react.get_redux_actions(conn)
 
 
@@ -502,7 +506,7 @@ async def get_interactive_elements(role: str | None = None) -> list[dict]:
     Returns:
         List of interactive element descriptors.
     """
-    conn, _, _, _, _, interact = await _ensure_connected()
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.get_interactive_elements(conn, role_filter=role)
 
 
@@ -521,7 +525,7 @@ async def click_element(selector: str) -> dict:
     Returns:
         Confirmation of the click or error if element not found.
     """
-    conn, _, _, _, _, interact = await _ensure_connected()
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.click_element(conn, selector)
 
 
@@ -540,7 +544,7 @@ async def fill_input(selector: str, value: str) -> dict:
     Returns:
         Confirmation with the resulting value.
     """
-    conn, _, _, _, _, interact = await _ensure_connected()
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.fill_input(conn, selector, value)
 
 
@@ -555,7 +559,7 @@ async def select_option(selector: str, option_value: str) -> dict:
     Returns:
         Confirmation or list of available options if not found.
     """
-    conn, _, _, _, _, interact = await _ensure_connected()
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.select_option(conn, selector, option_value)
 
 
@@ -574,5 +578,166 @@ async def wait_for_element(selector: str, timeout_ms: int = 10000) -> dict:
     Returns:
         Dict with found status and elapsed time.
     """
-    conn, _, _, _, _, interact = await _ensure_connected()
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.wait_for_element(conn, selector, timeout_ms=timeout_ms)
+
+
+# ─── New v0.4 tools ────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def hover_element(selector: str) -> dict:
+    """Hover over an element to reveal hidden UI.
+
+    Many UIs show action buttons, edit controls, dropdown triggers, and
+    tooltips only on hover. This dispatches mouseenter + mouseover +
+    mousemove events to trigger those states.
+
+    After hovering, call get_interactive_elements() to see the newly-
+    revealed elements, or take_screenshot() to see the visual change.
+
+    Args:
+        selector: CSS selector for the element to hover over (e.g., a
+                  table row, a card, a menu trigger).
+
+    Returns:
+        Confirmation of the hover or error if element not found.
+    """
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
+    return await interact.hover_element(conn, selector)
+
+
+@mcp.tool()
+async def press_key(
+    key: str,
+    modifiers: list[str] | None = None,
+    selector: str | None = None,
+) -> dict:
+    """Press a keyboard key.
+
+    Common uses:
+      - press_key("Enter") — submit a form
+      - press_key("Escape") — close a modal/dialog
+      - press_key("Tab") — move focus to next element
+      - press_key("ArrowDown") — navigate a dropdown
+      - press_key("a", modifiers=["ctrl"]) — select all
+      - press_key("Backspace") — delete character
+
+    Args:
+        key: Key name — "Enter", "Escape", "Tab", "ArrowDown", "ArrowUp",
+             "Backspace", "Delete", "Space", "Home", "End", or a single
+             character like "a".
+        modifiers: Optional list of modifier keys: "ctrl", "shift", "alt", "meta".
+        selector: Optional CSS selector to focus before pressing the key.
+
+    Returns:
+        Confirmation of the key press.
+    """
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
+    return await interact.press_key(conn, key, modifiers=modifiers, selector=selector)
+
+
+@mcp.tool()
+async def navigate_to(url: str) -> dict:
+    """Navigate the browser to a specific URL.
+
+    Direct navigation via CDP — faster and more reliable than finding
+    and clicking links. Use this for known routes:
+      - navigate_to("http://localhost:3000/shop/dashboard/quotes")
+      - navigate_to("http://localhost:3000/shop/quote/25/description")
+
+    After navigation, call wait_for_network_idle() before taking a
+    screenshot to ensure the page has fully loaded.
+
+    Args:
+        url: The URL to navigate to.
+
+    Returns:
+        Dict confirming the navigation.
+    """
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
+    return await runtime.navigate_to(conn, url)
+
+
+@mcp.tool()
+async def wait_for_network_idle(idle_ms: int = 500, timeout_ms: int = 10000) -> dict:
+    """Wait until all network requests have completed.
+
+    Monitors in-flight HTTP requests and waits until none are pending
+    for at least idle_ms milliseconds. Use this after navigation or
+    clicking something that triggers API calls — ensures the page is
+    fully loaded before taking a screenshot or inspecting state.
+
+    Args:
+        idle_ms: How long the network must be quiet to count as idle
+                 (default 500ms).
+        timeout_ms: Maximum wait time (default 10000ms).
+
+    Returns:
+        Dict with idle status, remaining in-flight count, and elapsed time.
+    """
+    _, _, network, _, _, _, _ = await _ensure_connected()
+    return await network.wait_for_idle(idle_ms=idle_ms, timeout_ms=timeout_ms)
+
+
+@mcp.tool()
+async def get_page_structure() -> dict | list:
+    """Get the semantic structure of the current page.
+
+    Walks the DOM using ARIA landmarks, roles, and semantic HTML to build
+    a structural map. Returns a tree showing:
+
+      - Major sections: navigation, main content, sidebars, dialogs
+      - Widget state: which tab is selected, what's expanded/collapsed
+      - Section contents: headings, interactive element counts, labels
+      - Data-testid anchors for stable references
+
+    This is the "what am I looking at?" tool. Use it to understand the
+    page layout before deciding what to interact with. Much more useful
+    than parsing a screenshot for structural understanding.
+
+    Returns:
+        Nested tree of page sections with roles, labels, and states.
+    """
+    conn, _, _, _, _, _, structure = await _ensure_connected()
+    return await structure.get_page_structure(conn)
+
+
+@mcp.tool()
+async def debug_snapshot() -> dict:
+    """Capture a complete debugging snapshot in one call.
+
+    Returns everything Claude needs to understand the current page state:
+      - Screenshot (file path to PNG)
+      - Page URL and title
+      - Console errors (last 10)
+      - Network errors (last 10)
+      - Page structure (semantic layout map)
+
+    This replaces the 5-call sequence of take_screenshot + get_page_info +
+    get_console_logs + get_network_errors + get_page_structure with a
+    single tool call. Use this as the starting point for any debugging
+    session.
+
+    Returns:
+        Dict with screenshot path, page info, errors, network errors,
+        and page structure.
+    """
+    conn, console, network, runtime, _, _, structure = await _ensure_connected()
+
+    # Gather everything in parallel where possible
+    screenshot = await runtime.take_screenshot(conn)
+    page_info = await runtime.get_page_info(conn)
+    console_errors = console.get_logs(level="error", limit=10)
+    exceptions = console.get_errors(limit=10)
+    network_errors = network.get_requests(errors_only=True, limit=10)
+    page_struct = await structure.get_page_structure(conn)
+
+    return {
+        "screenshot": screenshot.get("file_path"),
+        "page": page_info,
+        "console_errors": console_errors,
+        "exceptions": exceptions,
+        "network_errors": network_errors,
+        "page_structure": page_struct,
+    }

@@ -207,3 +207,29 @@ class Runtime:
             "truncated": truncated,
             "length": len(html),
         }
+
+    async def navigate_to(self, connection: CDPConnection, url: str) -> dict:
+        """Navigate the current tab to a URL.
+
+        Uses CDP Page.navigate for direct navigation. Faster and more
+        reliable than finding and clicking links, especially for known
+        routes.
+
+        Args:
+            connection: Active CDP connection.
+            url: The URL to navigate to.
+
+        Returns:
+            Dict with the navigation result.
+        """
+        result = await connection.send("Page.navigate", {"url": url})
+
+        error = result.get("errorText")
+        if error:
+            return {"error": error, "url": url}
+
+        return {
+            "navigated": True,
+            "url": url,
+            "frame_id": result.get("frameId", ""),
+        }

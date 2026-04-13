@@ -270,8 +270,164 @@ WAIT_SCRIPT = """
 })('%SELECTOR%', %TIMEOUT%)
 """
 
+# Hover — dispatches mouseenter + mouseover to reveal hidden UI
+HOVER_SCRIPT = """
+((selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return JSON.stringify({ error: 'Element not found: ' + selector });
+
+    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+    const rect = el.getBoundingClientRect();
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+
+    el.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }));
+    el.dispatchEvent(new MouseEvent('mouseover', opts));
+    el.dispatchEvent(new MouseEvent('mousemove', opts));
+
+    const label = el.textContent?.trim().substring(0, 50) || el.getAttribute('aria-label') || selector;
+    return JSON.stringify({ hovered: true, label, tag: el.tagName });
+})('%SELECTOR%')
+"""
+
 
 class Interactor:
+    """High-level browser interaction tools."""
+
+    async def hover_element(
+        self,
+        connection: CDPConnection,
+        selector: str,
+    ) -> dict:
+        """Hover over an element to reveal hidden UI.
+
+        Dispatches mouseenter + mouseover + mousemove events. This triggers
+        CSS :hover styles and JS hover handlers, which often reveal action
+        buttons, dropdown menus, tooltips, and edit controls that are hidden
+        until the user hovers.
+
+        After hovering, call get_interactive_elements() again to see the
+        newly-revealed elements.
+
+        Args:
+            connection: Active CDP connection.
+            selector: CSS selector for the element to hover over.
+
+        Returns:
+            Dict confirming the hover or error if element not found.
+        """
+        script = HOVER_SCRIPT.replace("%SELECTOR%", selector.replace("'", "\\'"))
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True},
+        )
+        return _parse_result(result)
+
+    async def press_key(
+        self,
+        connection: CDPConnection,
+        key: str,
+        modifiers: list[str] | None = None,
+        selector: str | None = None,
+    ) -> dict:
+        """Press a keyboard key.
+
+        Dispatches keyDown + keyUp via CDP Input.dispatchKeyEvent. Handles
+        special keys (Enter, Escape, Tab, ArrowDown, etc.) and regular
+        characters. Optionally focuses an element first.
+
+        Common uses:
+          - press_key("Enter") — submit a form
+          - press_key("Escape") — close a modal
+          - press_key("Tab") — move focus to next element
+          - press_key("ArrowDown") — navigate a dropdown
+          - press_key("a", modifiers=["ctrl"]) — select all
+
+        Args:
+            connection: Active CDP connection.
+            key: Key name — "Enter", "Escape", "Tab", "ArrowDown", "Backspace",
+                 or a single character like "a".
+            modifiers: Optional list of modifier keys: "ctrl", "shift", "alt", "meta".
+            selector: Optional CSS selector to focus before pressing.
+
+        Returns:
+            Dict confirming the key press.
+        """
+        # Focus element if selector provided
+        if selector:
+            await connection.send(
+                "Runtime.evaluate",
+                {
+                    "expression": f"document.querySelector('{selector}')?.focus()",
+                    "returnByValue": True,
+                },
+            )
+
+        # Build modifier bitmask
+        mod_flags = 0
+        if modifiers:
+            for m in modifiers:
+                if m == "alt":
+                    mod_flags |= 1
+                elif m == "ctrl":
+                    mod_flags |= 2
+                elif m == "meta":
+                    mod_flags |= 4
+                elif m == "shift":
+                    mod_flags |= 8
+
+        # Map special key names to CDP key identifiers and codes
+        key_map = {
+            "Enter": ("Enter", "\r", 13),
+            "Escape": ("Escape", "", 27),
+            "Tab": ("Tab", "\t", 9),
+            "Backspace": ("Backspace", "", 8),
+            "Delete": ("Delete", "", 46),
+            "ArrowUp": ("ArrowUp", "", 38),
+            "ArrowDown": ("ArrowDown", "", 40),
+            "ArrowLeft": ("ArrowLeft", "", 37),
+            "ArrowRight": ("ArrowRight", "", 39),
+            "Home": ("Home", "", 36),
+            "End": ("End", "", 35),
+            "Space": (" ", " ", 32),
+        }
+
+        if key in key_map:
+            key_id, text, code = key_map[key]
+        else:
+            # Single character
+            key_id = key
+            text = key
+            code = ord(key.upper()) if len(key) == 1 else 0
+
+        # keyDown
+        await connection.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyDown",
+                "key": key_id,
+                "text": text,
+                "windowsVirtualKeyCode": code,
+                "nativeVirtualKeyCode": code,
+                "modifiers": mod_flags,
+            },
+        )
+
+        # keyUp
+        await connection.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyUp",
+                "key": key_id,
+                "windowsVirtualKeyCode": code,
+                "nativeVirtualKeyCode": code,
+                "modifiers": mod_flags,
+            },
+        )
+
+        return {"pressed": True, "key": key, "modifiers": modifiers or []}
     """High-level browser interaction tools."""
 
     async def get_interactive_elements(
