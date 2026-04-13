@@ -21,6 +21,16 @@ class SpecterConfig:
     # Max buffered events per category
     max_buffer_size: int = 1000
 
+    # Browser-internal URLs that are never the app. These are always skipped
+    # when auto-selecting a tab. Everything else is fair game — Claude decides.
+    browser_internal_urls: tuple[str, ...] = (
+        "devtools://",
+        "chrome://",
+        "chrome-extension://",
+        "about:",
+        "edge://",
+    )
+
     @property
     def http_endpoint(self) -> str:
         return f"http://{self.debug_host}:{self.debug_port}"

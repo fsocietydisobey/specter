@@ -30,16 +30,21 @@ mcp = FastMCP(
     "specter",
     instructions=(
         "Specter gives you eyes into the browser. It connects to a running "
-        "Firefox instance and captures console logs, errors, network activity, "
-        "screenshots, and React component internals in real time.\n\n"
-        "Firefox must be running with: firefox --remote-debugging-port 9222\n\n"
+        "Chromium instance and captures console logs, errors, network activity, "
+        "screenshots, React component internals, and lets you interact with the page.\n\n"
+        "Chromium must be running with: chromium --remote-debugging-port=9222\n\n"
+        "IMPORTANT — Tab selection:\n"
+        "On first use, call list_tabs() to see all open tabs. Pick the correct "
+        "app tab and call connect_to_tab(id) before running other tools. The "
+        "auto-connect picks the first non-internal tab, which may not be the "
+        "right one if multiple app tabs are open.\n\n"
         "Debugging workflow:\n"
-        "1. take_screenshot — see what the user sees\n"
-        "2. get_console_logs — check for errors and warnings\n"
-        "3. get_network_errors — check for failed API calls\n"
-        "4. get_component_tree or get_component_at — inspect React components, props, hooks\n"
-        "5. get_redux_state — check Redux store state\n"
-        "6. evaluate_js — inspect any runtime state\n"
+        "1. list_tabs + connect_to_tab — connect to the right tab\n"
+        "2. take_screenshot — see what the user sees\n"
+        "3. get_console_logs — check for errors and warnings\n"
+        "4. get_network_errors — check for failed API calls\n"
+        "5. get_component_at or get_interactive_elements — understand the page\n"
+        "6. click_element / fill_input — interact with the page\n"
         "7. Fix the code, then take_screenshot again to verify"
     ),
 )
@@ -252,16 +257,70 @@ async def get_dom_html(selector: str = "body", outer: bool = False) -> dict:
 async def list_tabs() -> list[dict]:
     """List all open browser tabs.
 
-    Returns tab IDs, titles, and URLs. Use this to find the right tab
-    before running other debug commands, especially when multiple tabs
-    are open.
+    Returns tab IDs, titles, and URLs. Call this first, then use
+    connect_to_tab(id) to switch to the correct app tab.
 
     Returns:
-        List of tab dicts with id, title, url.
+        List of tab dicts with id, title, url, and which one is
+        currently connected (if any).
     """
     conn, _, _, _, _, _ = await _ensure_connected()
     targets = await conn.list_targets()
-    return [t.to_dict() for t in targets]
+    current = conn.current_target
+    result = []
+    for t in targets:
+        d = t.to_dict()
+        d["connected"] = current is not None and t.id == current.id
+        result.append(d)
+    return result
+
+
+@mcp.tool()
+async def connect_to_tab(tab_id: str) -> dict:
+    """Switch the Specter connection to a specific browser tab.
+
+    Use list_tabs() first to see all tabs and their IDs, then call this
+    with the ID of the tab you want to debug. This disconnects from the
+    current tab and reconnects to the specified one. All event buffers
+    (console, network) are cleared on reconnect.
+
+    Args:
+        tab_id: The tab ID from list_tabs() output.
+
+    Returns:
+        Dict with the connected tab's title and URL.
+    """
+    global _connection, _console, _network, _runtime, _react, _interact
+
+    config = load_config()
+
+    # Disconnect existing connection
+    if _connection and _connection.is_connected:
+        await _connection.disconnect()
+
+    # Fresh connection to the specified tab
+    _connection = CDPConnection(config)
+    _console = ConsoleCapture(config)
+    _network = NetworkCapture(config)
+    _runtime = Runtime(config)
+    _react = ReactInspector()
+    _interact = Interactor()
+
+    _console.register(_connection)
+    _network.register(_connection)
+
+    target = await _connection.connect(target_id=tab_id)
+    await _console.enable(_connection)
+    await _network.enable(_connection)
+
+    logger.info("Switched to tab: %s (%s)", target.title, target.url)
+
+    return {
+        "connected": True,
+        "tab_id": target.id,
+        "title": target.title,
+        "url": target.url,
+    }
 
 
 @mcp.tool()

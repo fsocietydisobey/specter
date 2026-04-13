@@ -104,23 +104,33 @@ class CDPConnection:
     async def connect(self, target_id: str | None = None) -> Target:
         """Connect to a browser target.
 
+        When target_id is not given, picks the first non-browser-internal tab
+        (filters out devtools://, chrome://, etc.). If multiple app tabs
+        remain, picks the first one. Claude can call list_tabs() to see all
+        tabs and then connect_to_tab(id) to switch.
+
         Args:
-            target_id: Specific target ID. If None, connects to the first
-                       page target (usually the active tab).
+            target_id: Specific target ID. If None, picks the first app tab.
 
         Returns:
             The connected Target.
 
         Raises:
-            ConnectionError: If Firefox isn't reachable or no page targets.
+            ConnectionError: If the browser isn't reachable or no page targets.
         """
         targets = await self.list_targets()
         if not targets:
-            raise ConnectionError("No page targets found. Is a page open in Firefox?")
+            raise ConnectionError("No page targets found. Is a page open in the browser?")
 
-        target = targets[0]
         if target_id:
             target = next((t for t in targets if t.id == target_id), targets[0])
+        else:
+            # Filter out browser-internal pages
+            app_tabs = [
+                t for t in targets
+                if not any(t.url.startswith(prefix) for prefix in self._config.browser_internal_urls)
+            ]
+            target = app_tabs[0] if app_tabs else targets[0]
 
         if not target.ws_url:
             raise ConnectionError(f"Target '{target.title}' has no WebSocket URL.")
