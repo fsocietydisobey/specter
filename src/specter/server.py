@@ -345,6 +345,24 @@ async def connect_to_tab(tab_id: str) -> dict:
 
 
 @mcp.tool()
+async def reload_page(ignore_cache: bool = False) -> dict:
+    """Reload the current page.
+
+    Useful after making code changes to see the updated result, or to
+    reset the page state before reproducing a bug.
+
+    Args:
+        ignore_cache: If true, does a hard reload (bypasses cache, like Ctrl+Shift+R).
+
+    Returns:
+        Dict confirming the reload.
+    """
+    conn, _, _, _, _, _ = await _ensure_connected()
+    await conn.send("Page.reload", {"ignoreCache": ignore_cache})
+    return {"reloaded": True, "ignore_cache": ignore_cache}
+
+
+@mcp.tool()
 async def clear_logs() -> dict:
     """Clear all buffered console logs and network entries.
 
