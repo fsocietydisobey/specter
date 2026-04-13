@@ -69,7 +69,12 @@ class CDPConnection:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None
+        if self._ws is None:
+            return False
+        try:
+            return self._ws.close_code is None
+        except Exception:
+            return False
 
     @property
     def current_target(self) -> Target | None:
@@ -178,7 +183,15 @@ class CDPConnection:
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[request_id] = future
 
-        await self._ws.send(json.dumps(message))
+        try:
+            await self._ws.send(json.dumps(message))
+        except websockets.ConnectionClosed as e:
+            self._pending.pop(request_id, None)
+            self._ws = None
+            raise RuntimeError(
+                f"WebSocket connection lost while sending {method}. "
+                "The browser tab may have navigated or closed."
+            ) from e
 
         try:
             result = await asyncio.wait_for(future, timeout=30.0)

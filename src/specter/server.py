@@ -78,8 +78,11 @@ async def _ensure_connected():
     _network.register(_connection)
 
     target = await _connection.connect()
-    await _console.enable(_connection)
-    await _network.enable(_connection)
+
+    # Enable all CDP domains we need
+    await _console.enable(_connection)     # Runtime domain
+    await _network.enable(_connection)     # Network domain
+    await _connection.send("Page.enable")  # Page domain (needed for screenshots)
 
     logger.info("Connected to: %s (%s)", target.title, target.url)
 
@@ -105,7 +108,25 @@ async def take_screenshot(
         Dict with file_path to the saved PNG, timestamp, and dimensions.
     """
     conn, _, _, runtime, _, _ = await _ensure_connected()
-    return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
+    try:
+        return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
+    except (RuntimeError, TimeoutError, OSError) as e:
+        # Connection may have gone stale — force reconnect and retry once
+        logger.warning("Screenshot failed (%s), reconnecting...", e)
+        await _force_reconnect()
+        conn, _, _, runtime, _, _ = await _ensure_connected()
+        return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
+
+
+async def _force_reconnect() -> None:
+    """Force-close the current connection so _ensure_connected creates a fresh one."""
+    global _connection
+    if _connection:
+        try:
+            await _connection.disconnect()
+        except Exception:
+            pass
+        _connection = None
 
 
 @mcp.tool()
