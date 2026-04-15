@@ -453,17 +453,47 @@ async def get_component_at(selector: str) -> dict:
 
 
 @mcp.tool()
+async def get_elements_grouped_by_component(selector: str) -> dict:
+    """Find elements matching a selector and group them by owning React component.
+
+    Use this when a CSS selector returns more elements than you expect —
+    common when the same data is rendered in multiple views simultaneously
+    (e.g., a "verified" view and "review" view both rendering the same
+    rows). Instead of a flat list of 6 ambiguous elements, this returns
+    two groups: {VerifiedSourcesView: 3 rows, ReviewSourcesView: 3 rows}.
+
+    Each element in a group includes: tag, text (first 80 chars), visible
+    state, bounding rect, data-testid, and id — so you can identify
+    which one to interact with.
+
+    Args:
+        selector: CSS selector to match (e.g., "[class*='SourceRow']").
+
+    Returns:
+        Dict with total count and groups keyed by component name.
+    """
+    conn, _, _, _, react, _, _ = await _ensure_connected()
+    return await react.get_elements_grouped_by_component(conn, selector)
+
+
+@mcp.tool()
 async def get_redux_state(path: str = "") -> dict:
-    """Read the Redux store state.
+    """PREFERRED: read Redux store state. Use THIS instead of evaluate_js.
 
-    With no path: returns a summary of top-level state keys and their
-    shapes (useful for orientation).
-    With a path: returns the value at that path (e.g., "auth.session"
-    returns the session object).
+    This tool already handles the hard parts:
+      - Checks window.__REDUX_STORE__, __NEXT_REDUX_WRAPPER_STORE__, window.store
+      - Walks ALL React fiber roots across ALL renderers (Next.js App Router
+        creates multiple roots — the store is often in a non-first root)
+      - Looks for Provider.store, Provider.value.store, and stateNode.store
+      - Caches the found store on window.__SPECTER_STORE__ for fast subsequent reads
+      - Safely serializes nested state with depth capping
 
-    The store is located via common globals: window.__REDUX_STORE__,
-    window.__NEXT_REDUX_WRAPPER_STORE__, or window.store. If your app
-    uses a different pattern, use evaluate_js to access it directly.
+    DO NOT manually walk __REACT_DEVTOOLS_GLOBAL_HOOK__ with evaluate_js —
+    this tool does it for you in one call. Reaching for evaluate_js first
+    is the #1 waste of calls in Specter.
+
+    With no path: summary of top-level state keys and their shapes.
+    With a path: the value at that path (e.g., "auth.session").
 
     Args:
         path: Dot-separated path into the state tree (e.g., "auth.session",

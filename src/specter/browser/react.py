@@ -399,6 +399,91 @@ REDUX_ACTIONS_SCRIPT = """
 })()
 """
 
+# Group DOM elements by their nearest React component ancestor.
+# Solves the "6 rows for 2 sources because of triple-mount" problem:
+# when the same data is rendered in multiple views, querySelectorAll
+# returns a flat list. This groups them by the owning component so
+# Claude can see which view each element came from.
+GROUP_BY_COMPONENT_SCRIPT = """
+((selector) => {
+  const elements = document.querySelectorAll(selector);
+  if (elements.length === 0) {
+    return JSON.stringify({ error: 'No elements match: ' + selector });
+  }
+
+  function nearestComponent(el) {
+    // Find the fiber attached to this DOM node
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return null;
+
+    let fiber = el[fiberKey];
+    // Walk up the fiber tree to find the nearest named component
+    while (fiber) {
+      const type = fiber.type;
+      if (type && (typeof type === 'function' || (typeof type === 'object' && type !== null))) {
+        const name = type.displayName || type.name;
+        if (name && name[0] === name[0].toUpperCase()) {
+          const src = fiber._debugSource;
+          return {
+            name,
+            source: src ? {
+              fileName: src.fileName,
+              lineNumber: src.lineNumber,
+            } : null,
+          };
+        }
+      }
+      fiber = fiber.return;
+    }
+    return null;
+  }
+
+  function elementSummary(el, index) {
+    const rect = el.getBoundingClientRect();
+    return {
+      index,
+      tag: el.tagName.toLowerCase(),
+      text: (el.textContent || '').trim().substring(0, 80),
+      visible: el.offsetParent !== null,
+      rect: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      data_testid: el.dataset?.testid || null,
+      id: el.id || null,
+    };
+  }
+
+  // Group elements by their owning component
+  const groups = new Map();
+  let globalIndex = 0;
+
+  for (const el of elements) {
+    const comp = nearestComponent(el);
+    const key = comp ? comp.name : '<no-component>';
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        component: key,
+        source: comp?.source || null,
+        elements: [],
+      });
+    }
+
+    groups.get(key).elements.push(elementSummary(el, globalIndex));
+    globalIndex++;
+  }
+
+  return JSON.stringify({
+    selector,
+    total: elements.length,
+    groups: Array.from(groups.values()),
+  });
+})('%SELECTOR%')
+"""
+
 
 class ReactInspector:
     """React component tree and Redux state inspector."""
@@ -496,6 +581,34 @@ class ReactInspector:
             {"expression": REDUX_ACTIONS_SCRIPT, "returnByValue": True, "awaitPromise": False},
         )
 
+        return _parse_js_result(result)
+
+    async def get_elements_grouped_by_component(
+        self,
+        connection: CDPConnection,
+        selector: str,
+    ) -> dict:
+        """Find elements matching a selector and group them by owning component.
+
+        Solves the "N rows for M sources because of multi-mount" problem:
+        when the same list/table is rendered in multiple views, a flat
+        querySelectorAll result is ambiguous. This groups results by the
+        nearest React component ancestor.
+
+        Args:
+            connection: Active CDP connection.
+            selector: CSS selector to match elements (e.g., "[class*='Row']").
+
+        Returns:
+            Dict with total element count and groups keyed by component name.
+        """
+        script = GROUP_BY_COMPONENT_SCRIPT.replace(
+            "%SELECTOR%", selector.replace("'", "\\'")
+        )
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True, "awaitPromise": False},
+        )
         return _parse_js_result(result)
 
     async def check_react_available(self, connection: CDPConnection) -> dict:
