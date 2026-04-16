@@ -8,6 +8,26 @@ Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), but wor
 
 Part of the dark MCP suite alongside [Séance](https://github.com/fsocietydisobey/seance) (semantic code search), [Scarlet](https://github.com/fsocietydisobey/scarlet) (codebase cartography), and Serena (LSP navigation).
 
+## Why "Specter"
+
+From the Latin *spectrum* — "appearance, vision" — by way of *specere*, "to look at, observe." The word predates the ghost sense; at its root, a specter is an **observer**, something that sees from a vantage the living can't occupy.
+
+That's the tool's function. A browser's internal state — console buffer, unhandled exceptions, network timing, React's fiber tree, Redux's store — is invisible during normal use. You can't look at it without special instruments. Specter is the instrument: it attaches to the browser over CDP and watches from a position the user can't reach, then reports back what it saw.
+
+Literary resonances that reinforce it:
+
+- **Hamlet's ghost** — returns to testify about what the living couldn't see. Specter does the same with exceptions and failed requests: bears witness to what went wrong when nobody was watching.
+- **"The ghost in the machine"** (Gilbert Ryle, 1949) — an observer inside the mechanism. A near-literal description of a CDP client: a watcher embedded in the browser process.
+- The gothic-novel specter — silently present, seeing everything, speaking only when summoned.
+
+It completes the suite:
+
+> Séance summons what's hidden in the code.  
+> [Scarlet](https://github.com/fsocietydisobey/scarlet) inscribes what Séance finds.  
+> Specter watches what the code does when it's running.
+
+Séance works on the source. Scarlet works on the structure. Specter works on the execution — the live evidence of what the code actually does, not what it was written to do.
+
 ## The debugging loop
 
 ```mermaid
