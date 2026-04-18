@@ -26,13 +26,76 @@ from specter.browser.connection import CDPConnection
 
 logger = logging.getLogger(__name__)
 
-# JavaScript that extracts all interactive elements with stable selectors
+# JavaScript that extracts all interactive elements with stable selectors.
+#
+# Two-pass discovery:
+#   Pass 1 — DOM-based: standard interactive tags, ARIA roles, tabindex.
+#   Pass 2 — React fiber walk: finds elements with onClick/onMouseDown/etc.
+#            handler props attached via React (the classic "clickable div"
+#            pattern that has no semantic marker in the DOM).
+#
+# Each element is enriched with:
+#   - componentOwner: nearest named React ancestor component (+ source file).
+#   - landmark: nearest ARIA landmark (main, nav, dialog, etc.) for grouping.
+#   - handlers: list of React event handler prop names (when discovered via fiber).
+#   - discoveredVia: "dom" or "react" — tells you how the element was found.
 EXTRACT_INTERACTIVES_SCRIPT = """
 (() => {
     const results = [];
     const seen = new Set();
+    const seenElements = new WeakSet();
 
-    // All potentially interactive elements
+    function isVisible(el) {
+        if (el.disabled) return false;
+        if (el.offsetParent === null && el.tagName !== 'INPUT') return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        return true;
+    }
+
+    function addElement(el, opts) {
+        opts = opts || {};
+        if (!el || el.nodeType !== 1) return;
+        if (seenElements.has(el)) return;
+        if (!isVisible(el)) return;
+
+        const selector = buildSelector(el);
+        if (seen.has(selector)) return;
+
+        const label = getLabel(el);
+        const tag = el.tagName;
+        if (!label && tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return;
+
+        seen.add(selector);
+        seenElements.add(el);
+
+        const rect = el.getBoundingClientRect();
+        const entry = {
+            selector,
+            tag: tag.toLowerCase(),
+            type: el.type || null,
+            role: el.getAttribute('role') || inferRole(el),
+            label: label || '',
+            placeholder: el.placeholder || null,
+            value: (tag === 'INPUT' || tag === 'TEXTAREA') ? (el.value || '').substring(0, 100) : null,
+            href: el.href || null,
+            disabled: el.disabled || false,
+            checked: el.checked !== undefined ? el.checked : null,
+            rect: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+            },
+            componentOwner: nearestNamedComponent(el),
+            landmark: findLandmark(el),
+            discoveredVia: opts.discoveredVia || 'dom',
+            handlers: opts.handlers || null,
+        };
+        results.push(entry);
+    }
+
+    // === Pass 1: DOM-based discovery ===
     const selectors = [
         'a[href]',
         'button',
@@ -51,45 +114,90 @@ EXTRACT_INTERACTIVES_SCRIPT = """
         'summary',
         'label[for]',
     ];
-
     const allElements = document.querySelectorAll(selectors.join(', '));
-
     for (const el of allElements) {
-        // Skip hidden elements
-        if (el.offsetParent === null && el.tagName !== 'INPUT' && el.type !== 'hidden') continue;
-        if (el.disabled) continue;
-        const style = getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        addElement(el, { discoveredVia: 'dom' });
+    }
 
-        // Build a stable selector for this element
-        const selector = buildSelector(el);
-        if (seen.has(selector)) continue;
-        seen.add(selector);
+    // === Pass 2: React fiber handler discovery ===
+    // Finds host fibers (DOM elements rendered by React) whose memoizedProps
+    // include event handler functions like onClick. Catches the div/span
+    // onClick pattern that the DOM pass misses.
+    try {
+        const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        if (hook && hook.renderers && hook.renderers.size > 0) {
+            const HANDLERS = ['onClick', 'onMouseDown', 'onDoubleClick', 'onPointerDown', 'onKeyDown', 'onKeyPress', 'onSubmit', 'onChange'];
+            const MAX_DEPTH = 200;
+            let walked = 0;
 
-        // Get the visible label/text
-        const label = getLabel(el);
-        if (!label && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA' && el.tagName !== 'SELECT') continue;
+            function walk(fiber, depth) {
+                if (!fiber || depth > MAX_DEPTH || walked > 20000) return;
+                walked++;
 
-        const rect = el.getBoundingClientRect();
+                if (typeof fiber.type === 'string' && fiber.stateNode && fiber.memoizedProps) {
+                    const props = fiber.memoizedProps;
+                    const handlers = [];
+                    for (const key of HANDLERS) {
+                        if (typeof props[key] === 'function') handlers.push(key);
+                    }
+                    if (handlers.length > 0) {
+                        addElement(fiber.stateNode, { discoveredVia: 'react', handlers });
+                    }
+                }
 
-        results.push({
-            selector,
-            tag: el.tagName.toLowerCase(),
-            type: el.type || null,
-            role: el.getAttribute('role') || inferRole(el),
-            label: label || '',
-            placeholder: el.placeholder || null,
-            value: el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ? (el.value || '').substring(0, 100) : null,
-            href: el.href || null,
-            disabled: el.disabled || false,
-            checked: el.checked !== undefined ? el.checked : null,
-            rect: {
-                x: Math.round(rect.x),
-                y: Math.round(rect.y),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-            },
-        });
+                if (fiber.child) walk(fiber.child, depth + 1);
+                if (fiber.sibling) walk(fiber.sibling, depth);
+            }
+
+            const rendererId = hook.renderers.keys().next().value;
+            const fiberRoots = hook.getFiberRoots(rendererId);
+            if (fiberRoots) {
+                for (const root of fiberRoots) {
+                    if (root.current) walk(root.current, 0);
+                }
+            }
+        }
+    } catch (e) {
+        // React not available — DOM pass already ran; continue.
+    }
+
+    function nearestNamedComponent(el) {
+        const key = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+        if (!key) return null;
+        let fiber = el[key];
+        while (fiber) {
+            const type = fiber.type;
+            if (type && (typeof type === 'function' || (typeof type === 'object' && type !== null))) {
+                const name = type.displayName || type.name;
+                if (name && name[0] === name[0].toUpperCase()) {
+                    const src = fiber._debugSource;
+                    return {
+                        name,
+                        source: src ? { fileName: src.fileName, lineNumber: src.lineNumber } : null,
+                    };
+                }
+            }
+            fiber = fiber.return;
+        }
+        return null;
+    }
+
+    function findLandmark(el) {
+        let current = el;
+        while (current && current !== document.body) {
+            const tag = current.tagName;
+            const role = current.getAttribute('role');
+            const aria = current.getAttribute('aria-label');
+            if (tag === 'MAIN' || role === 'main') return { type: 'main', label: aria || 'main' };
+            if (tag === 'NAV' || role === 'navigation') return { type: 'navigation', label: aria || 'nav' };
+            if (tag === 'HEADER' || role === 'banner') return { type: 'banner', label: aria || 'header' };
+            if (tag === 'ASIDE' || role === 'complementary') return { type: 'complementary', label: aria || 'aside' };
+            if (tag === 'FOOTER' || role === 'contentinfo') return { type: 'contentinfo', label: aria || 'footer' };
+            if (role === 'dialog' || role === 'alertdialog') return { type: 'dialog', label: aria || 'dialog' };
+            if (role === 'region' && aria) return { type: 'region', label: aria };
+            current = current.parentElement;
+        }
+        return { type: 'content', label: 'content' };
     }
 
     function buildSelector(el) {
@@ -268,6 +376,91 @@ WAIT_SCRIPT = """
     }
     return JSON.stringify({ found: false, timeout: true, elapsed: timeoutMs });
 })('%SELECTOR%', %TIMEOUT%)
+"""
+
+# Scroll a specific element into view and report its new position.
+SCROLL_TO_ELEMENT_SCRIPT = """
+((selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return JSON.stringify({ error: 'Element not found: ' + selector });
+
+    el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'nearest' });
+
+    const rect = el.getBoundingClientRect();
+    const inViewport = rect.top >= 0 && rect.left >= 0 &&
+        rect.bottom <= window.innerHeight && rect.right <= window.innerWidth;
+
+    return JSON.stringify({
+        scrolled: true,
+        selector,
+        rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+        },
+        inViewport,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+    });
+})('%SELECTOR%')
+"""
+
+# Scroll a container (or the window) by N viewport-sized steps in a direction.
+# Reports before/after positions so Claude can detect hitting the edge.
+SCROLL_WITHIN_SCRIPT = """
+((selector, direction, count) => {
+    const useWindow = !selector;
+    const scroller = useWindow ? null : document.querySelector(selector);
+    if (!useWindow && !scroller) {
+        return JSON.stringify({ error: 'Scroller not found: ' + selector });
+    }
+
+    const target = scroller || document.scrollingElement || document.documentElement;
+    const heightRef = scroller ? scroller.clientHeight : window.innerHeight;
+    const widthRef = scroller ? scroller.clientWidth : window.innerWidth;
+
+    const before = { scrollTop: target.scrollTop, scrollLeft: target.scrollLeft };
+
+    // Scroll by (viewport - 100px overlap) * count, to preserve context across steps
+    const stepY = Math.max(heightRef - 100, 100);
+    const stepX = Math.max(widthRef - 100, 100);
+
+    let deltaY = 0, deltaX = 0;
+    if (direction === 'down') deltaY = stepY * count;
+    else if (direction === 'up') deltaY = -stepY * count;
+    else if (direction === 'right') deltaX = stepX * count;
+    else if (direction === 'left') deltaX = -stepX * count;
+    else return JSON.stringify({ error: 'Invalid direction: ' + direction + ' (use up/down/left/right)' });
+
+    if (useWindow) {
+        window.scrollBy({ top: deltaY, left: deltaX, behavior: 'instant' });
+    } else {
+        scroller.scrollBy({ top: deltaY, left: deltaX, behavior: 'instant' });
+    }
+
+    const after = { scrollTop: target.scrollTop, scrollLeft: target.scrollLeft };
+    const moved = after.scrollTop !== before.scrollTop || after.scrollLeft !== before.scrollLeft;
+
+    // Detect edge: tried to scroll but nothing happened
+    const maxScrollTop = target.scrollHeight - target.clientHeight;
+    const maxScrollLeft = target.scrollWidth - target.clientWidth;
+    const atEnd = {
+        top: after.scrollTop <= 0,
+        bottom: after.scrollTop >= maxScrollTop - 1,
+        left: after.scrollLeft <= 0,
+        right: after.scrollLeft >= maxScrollLeft - 1,
+    };
+
+    return JSON.stringify({
+        scrolled: moved,
+        direction,
+        count,
+        scroller: useWindow ? 'window' : selector,
+        before,
+        after,
+        atEnd,
+    });
+})('%SELECTOR%', '%DIRECTION%', %COUNT%)
 """
 
 # Hover — dispatches mouseenter + mouseover to reveal hidden UI
@@ -549,6 +742,130 @@ class Interactor:
         )
 
         return _parse_result(result)
+
+    async def scroll_to_element(
+        self,
+        connection: CDPConnection,
+        selector: str,
+    ) -> dict:
+        """Scroll an element into view.
+
+        Useful when a target is rendered but below the fold — scrolling it
+        into view lets the next screenshot actually capture it, and lets
+        click/hover dispatch events at a valid viewport coordinate.
+
+        Args:
+            connection: Active CDP connection.
+            selector: CSS selector for the element to reveal.
+
+        Returns:
+            Dict with new bounding rect and whether the element is now in
+            the viewport.
+        """
+        script = SCROLL_TO_ELEMENT_SCRIPT.replace("%SELECTOR%", selector.replace("'", "\\'"))
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True},
+        )
+        return _parse_result(result)
+
+    async def scroll_within(
+        self,
+        connection: CDPConnection,
+        scroller_selector: str | None = None,
+        direction: str = "down",
+        count: int = 1,
+    ) -> dict:
+        """Scroll a container (or the window) by N viewport-sized steps.
+
+        Scrolls by roughly one viewport minus 100px overlap per step, so
+        content stays visible across steps. Use this to walk through long
+        lists, reveal virtualized rows, or scroll inside modals/panels
+        that have their own overflow.
+
+        Args:
+            connection: Active CDP connection.
+            scroller_selector: CSS selector for a scrollable container. Pass
+                None (or empty) to scroll the main window.
+            direction: "up", "down", "left", or "right".
+            count: Number of viewport-sized steps (default 1).
+
+        Returns:
+            Dict with before/after scroll positions and an atEnd flag for
+            each edge — lets you detect when scrolling is stuck.
+        """
+        sel = (scroller_selector or "").replace("'", "\\'")
+        script = (
+            SCROLL_WITHIN_SCRIPT
+            .replace("%SELECTOR%", sel)
+            .replace("%DIRECTION%", direction.replace("'", "\\'"))
+            .replace("%COUNT%", str(count))
+        )
+        result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": script, "returnByValue": True},
+        )
+        return _parse_result(result)
+
+    async def get_interactive_elements_grouped(
+        self,
+        connection: CDPConnection,
+        role_filter: str | None = None,
+    ) -> dict:
+        """Return interactive elements grouped by ARIA landmark and owning component.
+
+        Instead of a flat list of hundreds of elements, returns a tree:
+            landmark (main / nav / dialog / ...) →
+                component (nearest named React ancestor) →
+                    elements
+
+        This makes it easier to reason about the page's interactive surface.
+        Especially useful when a dialog opens — you can see the dialog's
+        interactives as a distinct group instead of mixed in with the page.
+
+        Args:
+            connection: Active CDP connection.
+            role_filter: Optional role filter ("button", "link", etc.) — applied
+                before grouping.
+
+        Returns:
+            Dict with "total" count and "landmarks" list, each containing
+            a list of components and their interactive elements.
+        """
+        flat = await self.get_interactive_elements(connection, role_filter=role_filter)
+
+        # Error case: extraction returned an error dict wrapped in a list
+        if len(flat) == 1 and isinstance(flat[0], dict) and "error" in flat[0]:
+            return {"error": flat[0]["error"]}
+
+        landmarks: dict[str, dict[str, list[dict]]] = {}
+        for el in flat:
+            lm = (el.get("landmark") or {}).get("type") or "content"
+            owner_info = el.get("componentOwner") or {}
+            owner = owner_info.get("name") or "<no-component>"
+            landmarks.setdefault(lm, {}).setdefault(owner, []).append(el)
+
+        result_landmarks = []
+        for lm_type, components in landmarks.items():
+            comp_list = []
+            for comp_name, elements in components.items():
+                # Pull a source from the first element's componentOwner (same for the group)
+                source = None
+                owner_obj = (elements[0].get("componentOwner") or {})
+                if owner_obj and owner_obj.get("source"):
+                    source = owner_obj["source"]
+                comp_list.append({
+                    "component": comp_name,
+                    "source": source,
+                    "count": len(elements),
+                    "elements": elements,
+                })
+            result_landmarks.append({
+                "landmark": lm_type,
+                "components": comp_list,
+            })
+
+        return {"total": len(flat), "landmarks": result_landmarks}
 
     async def wait_for_element(
         self,

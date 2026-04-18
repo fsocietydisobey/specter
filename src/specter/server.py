@@ -89,7 +89,17 @@ mcp = FastMCP(
         "close modals, `Tab` between fields.\n"
         "- **Diagnostic logs via `evaluate_js`.** To trace a runtime function, "
         "inject temporary `console.log` via monkey-patch; read back with "
-        "`get_console_logs`. Faster than editing source + reloading.\n\n"
+        "`get_console_logs`. Faster than editing source + reloading.\n"
+        "- **Busy pages: use `get_interactive_elements_grouped`.** Returns a "
+        "tree of landmarks → components → elements instead of a flat list of "
+        "hundreds. Also: `get_interactive_elements` now includes React fiber-"
+        "based discovery, so `<div onClick>` patterns with no ARIA markers "
+        "show up with `discoveredVia: 'react'` and the handler names.\n"
+        "- **Scroll before screenshotting/clicking.** If a target is below the "
+        "fold use `scroll_to_element(selector)`. For scrollable panels, "
+        "virtualized lists, or modals with internal overflow, use "
+        "`scroll_within(scroller_selector, direction, count)` — check `atEnd` "
+        "in the response to stop when you hit the edge.\n\n"
         "# Anti-patterns — DON'T\n\n"
         "- **Don't use `evaluate_js` for Redux state.** Use `get_redux_state(path)` "
         "— it handles multi-renderer fiber walking, store caching, safe "
@@ -598,6 +608,34 @@ async def get_interactive_elements(role: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
+async def get_interactive_elements_grouped(role: str | None = None) -> dict:
+    """Get interactive elements grouped by ARIA landmark and owning component.
+
+    Returns a tree:
+        landmarks → components → elements
+
+    instead of a flat list. Makes reasoning about a busy page much easier:
+    dialog contents stay separate from page contents, nav links from main
+    content actions, etc. Use this when the flat `get_interactive_elements`
+    returns too many entries to skim.
+
+    Each element carries the same metadata as `get_interactive_elements`,
+    including `componentOwner` (nearest named React ancestor), `landmark`,
+    `handlers` (if discovered via React fiber walk), and `discoveredVia`
+    ("dom" vs "react").
+
+    Args:
+        role: Optional filter by role ("button", "link", "textbox", etc.)
+              applied before grouping.
+
+    Returns:
+        Dict with total count and landmarks tree.
+    """
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
+    return await interact.get_interactive_elements_grouped(conn, role_filter=role)
+
+
+@mcp.tool()
 async def click_element(selector: str) -> dict:
     """Click an element by CSS selector.
 
@@ -667,6 +705,60 @@ async def wait_for_element(selector: str, timeout_ms: int = 10000) -> dict:
     """
     conn, _, _, _, _, interact, _ = await _ensure_connected()
     return await interact.wait_for_element(conn, selector, timeout_ms=timeout_ms)
+
+
+@mcp.tool()
+async def scroll_to_element(selector: str) -> dict:
+    """Scroll an element into the viewport.
+
+    Useful when a target is rendered but below the fold (or inside a
+    scrollable container). Screenshots only capture the viewport, and
+    click_element dispatches events at the element's current screen
+    coordinates — scrolling it in first is usually what you want before
+    a screenshot or click.
+
+    Args:
+        selector: CSS selector for the element to scroll into view.
+
+    Returns:
+        Dict with the element's new rect and an `inViewport` flag.
+    """
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
+    return await interact.scroll_to_element(conn, selector)
+
+
+@mcp.tool()
+async def scroll_within(
+    scroller_selector: str | None = None,
+    direction: str = "down",
+    count: int = 1,
+) -> dict:
+    """Scroll a container (or the window) by viewport-sized steps.
+
+    Use for walking through long lists, virtualized tables, or scrollable
+    panels/modals that have their own overflow (window scrolling alone
+    won't reach the bottom of a modal's internal list). Each step scrolls
+    by one viewport minus a 100px overlap so content stays visible across
+    steps.
+
+    Args:
+        scroller_selector: CSS selector for a scrollable container. Pass
+            None or "" to scroll the main window.
+        direction: "up", "down", "left", or "right".
+        count: Number of viewport-sized steps (default 1).
+
+    Returns:
+        Dict with before/after scroll positions, whether the scroll moved,
+        and an `atEnd` object flagging which edges are hit — so you can
+        stop scrolling when there's nothing more to reveal.
+    """
+    conn, _, _, _, _, interact, _ = await _ensure_connected()
+    return await interact.scroll_within(
+        conn,
+        scroller_selector=scroller_selector,
+        direction=direction,
+        count=count,
+    )
 
 
 # ─── New v0.4 tools ────────────────────────────────────────────────────
