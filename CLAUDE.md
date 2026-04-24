@@ -20,7 +20,7 @@ uv run specter serve               # Start MCP server (stdio)
 src/specter/
   __init__.py
   cli.py                        # CLI entry point (Click)
-  server.py                     # MCP server (FastMCP) — 10 tools
+  server.py                     # MCP server (FastMCP) — ~25 tools
   config.py                     # Config (debug port, screenshot dir)
   browser/
     __init__.py
@@ -54,6 +54,10 @@ Specter connects to this port via CDP WebSocket. If Firefox isn't running with t
 | `get_dom_html` | Get rendered HTML of a CSS selector |
 | `list_tabs` | List all open browser tabs |
 | `clear_logs` | Reset all event buffers |
+| `navigate_to` | Hard navigate via CDP Page.navigate (full reload, resets state) |
+| `router_navigate` | Client-side navigate via the app's own router (preserves state) |
+
+> The table above is a partial highlight. See `server.py` for the full tool set — includes interactive element discovery (DOM + React fiber), landmark grouping, scroll tools, React component tree inspection, Redux state reads, screenshot capture, etc.
 
 ## Conventions
 

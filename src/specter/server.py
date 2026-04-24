@@ -48,10 +48,16 @@ mcp = FastMCP(
         "4. **Start with `debug_snapshot()`.** One call returns screenshot + page "
         "info + console errors + network errors + page structure. Use this first; "
         "call individual tools only to drill into specifics.\n\n"
-        "5. **Navigate by clicking, not by URL.** The app's router controls "
-        "navigation; URL manipulation gets stripped or rewritten. Use "
-        "`get_interactive_elements(role='link')` → `click_element(selector)` → "
-        "`wait_for_network_idle()`.\n\n"
+        "5. **Prefer clicking over URL navigation for in-app flows.** The "
+        "app's router controls state — clicking a link via `click_element` "
+        "exercises the same code path a real user hits and preserves state. "
+        "For deep-linking or skipping a multi-step flow, use "
+        "`router_navigate(path)` (soft, tries link-click first then "
+        "`location.href`). Use `navigate_to(url)` only for cross-origin "
+        "navigation or deliberate full-page resets. **Next.js caveat:** App "
+        "Router can strip query params on programmatic navigation; if query "
+        "state matters, click the link instead. Always follow any navigation "
+        "with `wait_for_network_idle()` before the next interaction.\n\n"
         "6. **Don't fight with navigation to debug.** If you need to see data, use "
         "`evaluate_js` to inspect it directly — don't navigate to a different page "
         "hoping to see it visually. Screenshots are for visuals; data goes through "
@@ -816,11 +822,71 @@ async def press_key(
     return await interact.press_key(conn, key, modifiers=modifiers, selector=selector)
 
 
-# NOTE: navigate_to and router_navigate are DISABLED.
-# Next.js App Router strips query params and resets state on programmatic
-# navigation. Use click_element + get_interactive_elements to navigate
-# the app the same way a user would — by clicking links and buttons.
-# The code is in runtime.py if these are ever re-enabled.
+@mcp.tool()
+async def navigate_to(url: str) -> dict:
+    """Hard navigate the current tab to a URL (full page reload).
+
+    Uses CDP Page.navigate — equivalent to typing the URL in the address bar.
+    Triggers a full page load, resets all in-memory app state, and re-runs
+    every bootstrap effect. Use sparingly.
+
+    Prefer `click_element` on a link for intra-app navigation — that uses the
+    app's own router and keeps state. Use this tool when:
+      - You need to land on an absolute URL that isn't linked from the
+        current page.
+      - You want to explicitly reset app state (log out, clear a broken
+        client cache, start a session fresh).
+      - You're navigating to a DIFFERENT origin.
+
+    Caveat: for Next.js App Router apps, programmatic navigation can strip
+    query params in some flows. If query state matters, prefer
+    `router_navigate` or `click_element`.
+
+    Args:
+        url: Absolute URL to navigate to (e.g., "http://localhost:3000/shop").
+
+    Returns:
+        Dict with {navigated, url, type: "hard", frame_id} or {error, url}.
+    """
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
+    return await runtime.navigate_to(conn, url)
+
+
+@mcp.tool()
+async def router_navigate(path: str) -> dict:
+    """Client-side navigate using the app's own router.
+
+    Softer alternative to `navigate_to`. Tries in order:
+      1. Click an existing `<a href>` link that matches the target path
+         (most reliable for Next.js — uses the app's Link behavior).
+      2. Fall back to `window.location.href = path` for same-origin paths,
+         which most SPA routers intercept as soft transitions.
+
+    Keeps app state (Redux, React context, Zustand, etc.) when the app's
+    router handles the transition. The link-click path is preferred because
+    it exercises the same code path as a real user click.
+
+    Use this when:
+      - You want to deep-link to a URL without breaking app state.
+      - There's no visible link to click (e.g., the target only renders
+        after a multi-step flow you'd rather skip).
+
+    Known caveats:
+      - Next.js App Router may strip query params on some `location.href`
+        transitions. If that bites you, `click_element` the link directly.
+      - After navigating, call `wait_for_network_idle()` before the next
+        interaction — the new route's data fetches are in flight.
+
+    Args:
+        path: Path + optional query (e.g., "/shop/quote/6/description"
+              or "/shop/quote/6/description?source=9"). Must be same-origin.
+
+    Returns:
+        Dict with {navigated, path, router: "link-click"|"location-href"}
+        or a "already on this path" no-op.
+    """
+    conn, _, _, runtime, _, _, _ = await _ensure_connected()
+    return await runtime.router_navigate(conn, path)
 
 
 @mcp.tool()
